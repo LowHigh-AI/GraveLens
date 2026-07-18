@@ -99,3 +99,38 @@ Investigation of the two Supabase projects changed the picture fundamentally:
 
 ## Status log
 - 2026-07-18: Analysis + safe structural merge done (14 conflicts parked on integration branch). CORRECTED TOPOLOGY discovered: Robert already migrated GraveLens to shared LowHigh backend (eqizlmdknjppefzpdogg). No 259-graves migration needed by us; canonical names are gravelens_scans / gravelens_scan_identity_index. Next: backup steps, then rewire code to canonical names + resolve conflicts. NO DDL on shared project without approval.
+
+---
+
+## ✅ SHARED-DB MIGRATION APPLIED (2026-07-18)
+`gravelens_burial_index` created + backfilled on the shared LowHigh project (`eqizlmdknjppefzpdogg`):
+- Table + 3 indexes + `auth read` RLS policy + `gravelens_upsert_burial_index` (security-definer, auth-guarded, anon revoked) — matches Robert's conventions exactly.
+- **23 rows backfilled** from the old project's `burial_index` (scan_count history preserved).
+- Verified: gravelens_scans still 256, 176 total tables — no other app's table touched. Advisor: only the standard SECURITY-DEFINER notice shared by all 43 gravelens_ functions (mine hardened identically).
+- Migration file: `db/migrations/gravelens_burial_index.sql`.
+
+## CODE MERGE PLAYBOOK (task 24 — the remaining work)
+Re-run `git merge origin/main --no-commit` on `integration/v1-reconcile`, then resolve 14 files. Strategy: **take THEIRS as base + re-apply OUR feature additions**, rewiring to CANONICAL LIVE names.
+
+**Canonical names (from the LIVE shared DB — NOT the reference schema):**
+- table `graves` → `gravelens_scans` · `grave_identity_index` → `gravelens_scan_identity_index` · rpc `upsert_grave_identity` → `gravelens_upsert_scan_identity`
+- `user_profiles`/`user_relationships`/`local_history_cache`/`cemetery_cache`/`military_context_cache` → `gravelens_`-prefixed
+- our `burial_index` → `gravelens_burial_index` · `upsert_burial_index` → `gravelens_upsert_burial_index` (now live)
+- **COLUMN renames too:** profile `grave_count`→`scan_count`, `public_grave_count`→`public_scan_count` (their community.ts already does this — adopt it)
+- rate limiting: drop our inline `checkRateLimit`; use their `requireRateLimit` (`gravelens_rate_limits`)
+
+**Per-file resolution:**
+- `community.ts`: take THEIRS (has gravelens_ names + column renames for profiles/relationships/caches/scans) + ADD our functions: `searchBurialIndexPeople`, `fetchBurialIndexRelatives`, `computePersonIdentityKey`, `checkResearchCache`/`saveResearchCache` (→ `gravelens_scan_identity_index` / `gravelens_upsert_scan_identity`), `upsertBurialIndex` (→ `gravelens_upsert_burial_index`), `BurialIndexRelative`/`BurialIndexPerson` types.
+- `cloudSync.ts`: take THEIRS (photoProxyUrl, gravelens_scans) + our SVG-placeholder passthrough in uploadPhoto.
+- `lookup/route.ts`: THEIRS skeleton (`after`, `requireRateLimit`, gravelens cache) + re-add our WikiTree source, burial harvest, extraction-validation escalation, family additions.
+- `analyze/route.ts`: THEIRS auth/rate-limit + our extraction validation + escalation triggers.
+- `cultural`/`narrative`/`story` routes: THEIRS (adds gravelens_ai_content_cache) + our JSON-salvage/cache_control if missing.
+- `ResultPage.tsx`: OURS (slimmed + ResearchSummaryCard + research/cards import) reconciled with their ecosystem/billing hooks. Biggest file — care.
+- `CapturePage.tsx`: THEIRS (ecosystem shell, auth-gate, wakeLock) + our "Research a name" link + quality-warning flow.
+- `ArchiveMap.tsx`: reconcile our pins/family work with theirs.
+- `global-error.tsx`: keep ONE (prefer theirs if it matches the v1.0.0 shell).
+- `sw-register.tsx`: our dev-unregister + their version bits.
+- `next.config.ts` / `package.json`: take theirs (v1.0.0) + our vitest devDeps; regenerate lockfile with npm 11.
+- `supabase-schema.sql`: accept THEIR deletion (superseded by db/migrations/).
+
+After merge: `git grep -nE '\.(from|rpc)\("(graves|grave_identity_index|user_profiles|burial_index|rate_limits|upsert_grave_identity|upsert_burial_index)"'` must return NOTHING (all rewired). Then tsc/lint/vitest/build green. Point `.env.local` at shared project to verify features against real data. Review → merge to main.
