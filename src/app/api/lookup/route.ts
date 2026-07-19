@@ -1,5 +1,5 @@
 import { searchSanbornMap } from "@/lib/apis/sanborn";
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { requireAuth } from "@/lib/apiAuth";
 import { searchNewspapers, searchLocalAreaNews } from "@/lib/apis/chronicling";
 import { searchNaraRecords } from "@/lib/apis/nara";
@@ -41,15 +41,27 @@ function unwrap<T>(r: PromiseSettledResult<SourceResult<T>>): SourceResult<T> {
 const EMPTY_SOURCE: SourceResult<never> = { status: "empty", records: [] };
 import { createClient } from "@/lib/supabase/server";
 import {
-  checkLocalHistoryCache, saveLocalHistoryCache,
-  computePersonIdentityKey, checkResearchCache, saveResearchCache,
+  checkLocalHistoryCache,
+  saveLocalHistoryCache,
+  // Research-response cache: theirs (hardened, gravelens_scan_identity_index)
+  computeGraveIdentityHash,
+  checkGraveIdentityIndex,
+  upsertGraveIdentityIndex,
+  // Burial index harvest: ours (gravelens_burial_index)
+  computePersonIdentityKey,
   upsertBurialIndex,
 } from "@/lib/community";
 import { CURRENT_RESEARCH_VERSION } from "@/lib/researchVersion";
+import { requireRateLimit } from "@/lib/rateLimit";
 
 export async function POST(req: NextRequest) {
   const auth = await requireAuth();
   if (auth instanceof NextResponse) return auth;
+
+  // This route fans out to ~10 external genealogical APIs; rate-limit to avoid
+  // being used as an amplifier against them.
+  const rl = await requireRateLimit(auth.userId, "lookup");
+  if (rl) return rl;
 
   try {
     const {
@@ -61,11 +73,15 @@ export async function POST(req: NextRequest) {
       city, county, state, cemetery,
       inscription = "",
       symbols = [],
+      confidence,
       supplemental = false,
     } = await req.json();
 
     const hasCoords = typeof lat === "number" && typeof lng === "number" && (lat !== 0 || lng !== 0);
     const supabase = await createClient();
+
+    // Stable cross-user identity for reusing another contributor's research.
+    const identityHash = computeGraveIdentityHash(firstName, lastName, birthYear, deathYear, lat, lng);
 
     // ── Check local history cache ───────────────────────────────────────────
     let cachedHistory = null;
@@ -138,6 +154,33 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // ── Grave identity index: reuse a prior contributor's research snapshot ──
+    // Another user (or this user, on a re-scan) may already have run the full
+    // fan-out for this exact person. If so, serve the cached public-record
+    // research instantly and skip every external call.
+    if (identityHash) {
+      const match = await checkGraveIdentityIndex(supabase, identityHash).catch(() => null);
+      if (match) {
+        const snap = match.researchSnapshot as
+          | (Record<string, unknown> & { researchVersion?: number })
+          | null;
+        // Treat a version-stale snapshot as a miss so a pipeline bump re-enriches.
+        if (snap && snap.researchVersion === CURRENT_RESEARCH_VERSION) {
+          const cachedLocalHistory = cachedHistory?.localHistory;
+          return NextResponse.json({
+            ...snap,
+            // localHistory is geo-cached separately; serve it only if that hit.
+            localHistory:
+              cachedLocalHistory && Object.keys(cachedLocalHistory).length > 0
+                ? cachedLocalHistory
+                : undefined,
+            fromCache: true,
+            contributorCount: match.contributorCount,
+          });
+        }
+      }
+    }
+
     // ── Phase 1: person-specific lookups ────────────────────────────────────
 
     const isMilitary = hasMilitaryIndicators(inscription, symbols);
@@ -182,15 +225,8 @@ export async function POST(req: NextRequest) {
         }
       : null;
 
-    if (identityKey && burialEntry) {
-      const cached = await checkResearchCache(
-        supabase, identityKey, CURRENT_RESEARCH_VERSION
-      ).catch(() => null);
-      if (cached) {
-        await upsertBurialIndex(supabase, burialEntry).catch(() => {});
-        return NextResponse.json({ ...cached, cachedResearch: true });
-      }
-    }
+    // Research-response cache is served by their identity-index check above.
+    // burialEntry/identityKey are still computed for the harvest at write-back.
 
     const [
       newspapers, naraRecords, landRecords, historical, cemeteryWikiUrl,
@@ -315,7 +351,7 @@ export async function POST(req: NextRequest) {
       landRecords:        landRecords.status   === "fulfilled" ? landRecords.value   : [],
       historical:         historical.status    === "fulfilled" ? historical.value    : {},
       cemeteryWikiUrl:    cemeteryWikiUrl.status === "fulfilled" ? cemeteryWikiUrl.value : undefined,
-      militaryContext,
+      militaryContext:    militaryContext ?? undefined,
       localHistory:       Object.keys(localHistory).length > 0 ? localHistory : undefined,
       wikitree:           wikitreeR.records.length     > 0 ? wikitreeR.records   : undefined,
       familySearchHints:  fsHintsR.records.length     > 0 ? fsHintsR.records     : undefined,
@@ -332,17 +368,29 @@ export async function POST(req: NextRequest) {
       researchVersion:    CURRENT_RESEARCH_VERSION,
     };
 
-    // Harvest the scan and cache the finished research (await: serverless
-    // runtimes may kill work scheduled after the response is returned).
-    // Don't cache runs with transient failures — the next scan should retry.
+    // ── Burial-index harvest (ours) — pool the stone's public facts so the
+    // family-plot feature + manual /research see this person. Non-blocking.
     if (identityKey && burialEntry) {
-      const anyFailed = Object.values(sourceStatus).some((s) => s.status === "failed");
-      await Promise.allSettled([
-        upsertBurialIndex(supabase, burialEntry),
-        anyFailed
-          ? Promise.resolve()
-          : saveResearchCache(supabase, identityKey, responseBody, CURRENT_RESEARCH_VERSION),
-      ]);
+      after(() => upsertBurialIndex(supabase, burialEntry).catch(() => {}));
+    }
+
+    // ── Research-response cache write-back (theirs) — seed the shared identity
+    // index for other contributors. Confidence-gated so low-confidence OCR
+    // can't poison the shared pool; only for records with enough identifying
+    // data. localHistory is excluded (geo-cell cached separately); no user
+    // notes/tags ever enter this snapshot — public-record research only.
+    const canCacheIdentity =
+      identityHash &&
+      confidence !== "low" &&
+      (firstName || lastName) &&
+      (birthYear || deathYear);
+    if (canCacheIdentity) {
+      const snapshot = { ...responseBody, localHistory: undefined };
+      after(() =>
+        upsertGraveIdentityIndex(supabase, identityHash as string, snapshot).catch((err) =>
+          console.error("[grave-identity-index-save] failed:", err)
+        )
+      );
     }
 
     return NextResponse.json(responseBody);

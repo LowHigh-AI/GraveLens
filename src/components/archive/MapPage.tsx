@@ -32,6 +32,13 @@ export default function MapPage() {
   });
   const [findTrigger, setFindTrigger] = useState(0);
   const [hasManualResults, setHasManualResults] = useState(false);
+  const [searchToast, setSearchToast] = useState<string | null>(null);
+  const searchToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showSearchToast = useCallback((msg: string) => {
+    setSearchToast(msg);
+    if (searchToastTimerRef.current) clearTimeout(searchToastTimerRef.current);
+    searchToastTimerRef.current = setTimeout(() => setSearchToast(null), 4000);
+  }, []);
 
   // Geolocation & Ghost Tour State
   const [userLocation, setUserLocation] = useState<[number, number] | null>(null);
@@ -271,9 +278,11 @@ export default function MapPage() {
           findRadius={findRadius}
           findTrigger={findTrigger}
           userLocation={userLocation}
-          onSearchStateChange={(_searching, hasResults) => {
-            setHasManualResults(hasResults);
-          }}
+          onSearchStateChange={(_searching, hasResults) => setHasManualResults(hasResults)}
+          // All post-search messaging (failure / cap / clamp / empty) is owned by
+          // ArchiveMap's handleSearchHere and routed through this single channel so
+          // the messages don't clobber each other in the shared one-slot toast.
+          onSearchNotice={(msg) => (msg ? showSearchToast(msg) : setSearchToast(null))}
           onClearFind={() => setFindTrigger(0)}
         />
       )}
@@ -311,6 +320,16 @@ export default function MapPage() {
           <button onClick={() => setTourToast(null)} className="w-6 h-6 flex items-center justify-center text-stone-500 shrink-0">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
           </button>
+        </div>
+      )}
+
+      {/* Search: transient notice (no results / clamped to center) */}
+      {searchToast && (
+        <div
+          className="absolute bottom-24 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 px-4 py-2.5 rounded-full text-sm font-medium animate-fade-in"
+          style={{ background: "rgba(10,9,8,0.88)", border: "1px solid rgba(201,168,76,0.3)", color: "var(--t-stone-300)", backdropFilter: "blur(8px)" }}
+        >
+          {searchToast}
         </div>
       )}
 

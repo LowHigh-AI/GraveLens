@@ -5,7 +5,9 @@ import BottomNav from "@/components/layout/BottomNav";
 import DesktopNav from "@/components/layout/DesktopNav";
 import ProfileBadge from "@/components/auth/ProfileBadge";
 import BrandLogo from "@/components/ui/BrandLogo";
+import { EcosystemLauncher } from "@/components/ecosystem/lowhighShell";
 import { useIsDesktop } from "@/hooks/useIsDesktop";
+import TokenAlertBar from "@/components/billing/TokenAlertBar";
 
 interface PageShellProps {
   children: ReactNode;
@@ -56,6 +58,8 @@ export default function PageShell({
   return (
     <div className={`flex flex-col h-full ${backgroundClass} overflow-hidden relative w-full lg:pl-56`}>
       {isDesktop && <DesktopNav />}
+      {/* Running-low / out-of-tokens system bar (dismissible; dot persists on the badge). */}
+      <TokenAlertBar />
       {/* Offline banner */}
       {offline && (
         <div
@@ -76,14 +80,14 @@ export default function PageShell({
 
       {/* Header */}
       <header
-        className="flex-shrink-0 z-30 bg-stone-950/80 backdrop-blur-2xl border-b border-stone-800/50 shadow-sm"
+        className="flex-shrink-0 z-30 bg-stone-950/80 backdrop-blur-2xl"
         style={{ paddingTop: "max(0.75rem, env(safe-area-inset-top))" }}
       >
         <div className="flex flex-col gap-3 px-4 pb-3 pt-1">
           {/* Top Row: Brand & Core Actions */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="flex flex-col">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="flex flex-col min-w-0">
                 {showLogo && !isDesktop ? (
                   <div className="flex flex-col">
                     <div className="flex items-center gap-2">
@@ -99,7 +103,7 @@ export default function PageShell({
                 ) : (
                   <div className="flex items-center gap-2.5 py-1">
                     {icon && <div className="text-gold-400 shrink-0">{icon}</div>}
-                    <h1 className="font-serif font-bold text-xl tracking-tight text-stone-50">
+                    <h1 className="font-serif font-bold text-xl tracking-tight text-stone-50 truncate">
                       {title}
                     </h1>
                   </div>
@@ -108,9 +112,15 @@ export default function PageShell({
               {headerTitleActions}
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 min-w-0">
               {headerActions}
-              {!isDesktop && <ProfileBadge />}
+              {/* Ecosystem app switcher (shared LowHigh shell). Renders from
+                  the central app catalog; anchored dropdown, safe inside the
+                  header. */}
+              <EcosystemLauncher />
+              {/* Profile/account control lives top-right in the header on both
+                  desktop and mobile, mirroring the LowHigh global header. */}
+              <ProfileBadge />
             </div>
           </div>
 

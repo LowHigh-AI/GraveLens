@@ -1,19 +1,22 @@
 "use client";
 
-// OAuth callback page — handles the redirect from Google via Supabase.
-//
-// Two flows arrive here:
-//   1. Popup flow (iOS PWA):  the OAuth opened in a new Safari tab.
-//      We exchange the code, try to close this tab, and show a "Return to app"
-//      screen as fallback in case window.close() is blocked.
-//   2. Redirect flow (fallback): the full window navigated here.
-//      We exchange the code and navigate to the app normally.
+// Auth callback page — the single return point for every cross-domain / email
+// auth round-trip:
+//   1. OAuth (Google), magic link, email confirmation, recovery — exchange the
+//      code/token_hash for a session, then push it up to the central LowHigh SSO
+//      cookie so lowhigh.ai is signed in too.
+//   2. SSO restore (?sso_code=...) — trade the one-time code for a session that
+//      already exists on lowhigh.ai; do NOT push it back up.
+//   3. SSO miss (?sso=none) — the central session was empty; proceed anonymously.
+// iOS PWA popup flow is preserved: we still try window.close() + a visible
+// fallback button when no SSO redirect is in flight.
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import BrandLogo from "@/components/ui/BrandLogo";
 import { createClient } from "@/lib/supabase/browser";
+import { exchangeSsoCode, establishCentralSession, markSsoTried } from "@/lib/ssoClient";
 
 type Status = "loading" | "success" | "error";
 
@@ -24,15 +27,43 @@ export default function AuthCallbackPage() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    const ssoCode = params.get("sso_code");
+    const ssoMiss = params.get("sso");
     const code = params.get("code");
     const tokenHash = params.get("token_hash");
     const type = params.get("type") ?? "signup";
-    const next = params.get("next") ?? "/";
+    // Only allow same-origin relative paths — reject absolute ("https://evil.com")
+    // and protocol-relative ("//evil.com") values to prevent an open redirect.
+    const rawNext = params.get("next") ?? "/";
+    const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
     const oauthError = params.get("error");
 
     if (oauthError) {
       setErrorMsg(oauthError.replace(/_/g, " "));
       setStatus("error");
+      return;
+    }
+
+    // SSO silent-check came back empty — no central session. Proceed anonymously
+    // to the originally requested page (gated pages will route to /login).
+    if (!ssoCode && ssoMiss === "none") {
+      markSsoTried();
+      router.replace(next);
+      return;
+    }
+
+    // SSO restore: trade the one-time code for a native session. The session
+    // originates from the central cookie, so we do NOT push it back up.
+    if (ssoCode) {
+      exchangeSsoCode(ssoCode).then((ok: boolean) => {
+        if (!ok) {
+          markSsoTried();
+          router.replace(`/login?next=${encodeURIComponent(next)}`);
+          return;
+        }
+        setStatus("success");
+        setTimeout(() => router.replace(next), 200);
+      });
       return;
     }
 
@@ -44,21 +75,18 @@ export default function AuthCallbackPage() {
 
     const supabase = createClient();
 
-    // token_hash is used by email confirmation links — it requires no stored
-    // PKCE verifier so it works when the link is opened in any browser context.
-    // code is used by the OAuth/PKCE popup flow.
-    const authPromise = tokenHash
-      ? supabase.auth.verifyOtp({ token_hash: tokenHash, type: type as "signup" | "magiclink" | "recovery" | "email_change" | "email" })
-      : supabase.auth.exchangeCodeForSession(code!);
+    const onError = (message: string) => {
+      setErrorMsg(message);
+      setStatus("error");
+    };
 
-    authPromise.then(({ error }: { error: import("@supabase/supabase-js").AuthError | null }) => {
-      if (error) {
-        setErrorMsg(error.message);
-        setStatus("error");
-        return;
-      }
-
+    const onSuccess = async () => {
       setStatus("success");
+
+      // Fresh login — push the session up to the central SSO cookie so lowhigh.ai
+      // is signed in too. If this performs a top-level redirect we're done.
+      const navigating = await establishCentralSession(next);
+      if (navigating) return;
 
       // Popup flow: try to close this tab so the user lands back in the PWA.
       try {
@@ -71,7 +99,36 @@ export default function AuthCallbackPage() {
       setTimeout(() => {
         router.replace(next);
       }, 400);
-    });
+    };
+
+    // token_hash is used by all email links (confirmation, recovery, magic link,
+    // email change). verifyOtp requires no stored PKCE verifier, so it works even
+    // when the link is opened on a different device/browser than started signup.
+    if (tokenHash) {
+      supabase.auth
+        .verifyOtp({ token_hash: tokenHash, type: type as "signup" | "magiclink" | "recovery" | "email_change" | "email" })
+        .then(({ error }: { error: import("@supabase/supabase-js").AuthError | null }) =>
+          error ? onError(error.message) : onSuccess()
+        );
+      return;
+    }
+
+    // OAuth / PKCE (?code=). @supabase/ssr's createBrowserClient forces
+    // detectSessionInUrl: true (un-overridable), so the client already redeems the
+    // code on init. Calling exchangeCodeForSession here too would double-spend the
+    // one-time verifier and throw "PKCE code verifier not found in storage". Instead,
+    // wait for the session detectSessionInUrl establishes (it resolves asynchronously).
+    (async () => {
+      for (let i = 0; i < 20; i++) {
+        const { data } = await supabase.auth.getSession();
+        if (data.session) {
+          onSuccess();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+      onError("Sign-in timed out. Please try again.");
+    })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

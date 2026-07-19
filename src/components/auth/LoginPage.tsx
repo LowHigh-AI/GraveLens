@@ -1,12 +1,21 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import BrandLogo from "@/components/ui/BrandLogo";
 import { createClient } from "@/lib/supabase/browser";
+import { establishCentralSession } from "@/lib/ssoClient";
 import { syncLocalToCloud, hasEverSynced, pullExplorerPoints } from "@/lib/cloudSync";
 
 type Mode = "signin" | "signup" | "confirm";
+
+// This app's brand + canonical base URL, stashed in user metadata at signup so the
+// shared Supabase Auth emails render the right brand ({{ .Data.app_name }}) and route
+// the confirmation link back to the right domain ({{ .Data.app_base_url }}).
+const APP_NAME = "GraveLens";
+const APP_BASE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL ||
+  (typeof window !== "undefined" ? window.location.origin : "");
 
 export default function LoginPage() {
   const router = useRouter();
@@ -18,7 +27,9 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [oauthLoading, setOauthLoading] = useState(false);
   const [resent, setResent] = useState(false);
+  const [notice, setNotice] = useState("");
   const [error, setError] = useState(
     authError === "auth_failed" ? "Sign-in failed. Please try again." : ""
   );
@@ -31,10 +42,24 @@ export default function LoginPage() {
     });
   }, [next, router]);
 
+  const callbackUrl = useCallback(
+    () => `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}`,
+    [next]
+  );
+
+  // After a local session is established, push it up to the shared LowHigh SSO
+  // cookie so a later visit to lowhigh.ai is already signed in. If SSO isn't
+  // enabled this no-ops and we navigate to `next` ourselves.
+  const finishLogin = useCallback(async () => {
+    const navigating = await establishCentralSession(next);
+    if (!navigating) router.replace(next);
+  }, [next, router]);
+
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError("");
+    setNotice("");
 
     const supabase = createClient();
     try {
@@ -42,7 +67,7 @@ export default function LoginPage() {
         const { data, error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) { setError(error.message); return; }
         if (data.user) await runPostLoginSync(supabase, data.user.id);
-        router.replace(next);
+        await finishLogin();
       } else {
         // Sign up — if "Confirm email" is enabled in Supabase, this sends a
         // confirmation email with an 8-character OTP and session is null. We show
@@ -52,7 +77,15 @@ export default function LoginPage() {
           email,
           password,
           options: {
-            emailRedirectTo: `${window.location.origin}/auth/callback?next=${next}`,
+            // Seed the display_name metadata shape LowHigh's UI expects, so a
+            // user who first signs up via GraveLens has a usable LowHigh profile.
+            // app_base_url / app_name drive the shared Supabase Auth email links + copy.
+            data: {
+              display_name: email.split("@")[0],
+              app_base_url: APP_BASE_URL,
+              app_name: APP_NAME,
+            },
+            emailRedirectTo: callbackUrl(),
           },
         });
         if (error) { setError(error.message); return; }
@@ -65,12 +98,60 @@ export default function LoginPage() {
         if (data.session) {
           // Email confirmation is disabled — signed in immediately
           await runPostLoginSync(supabase, data.session.user.id);
-          router.replace(next);
+          await finishLogin();
         } else {
           // Email confirmation is enabled — tell user to check their email
           setMode("confirm");
         }
       }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGoogle = async () => {
+    setError("");
+    setNotice("");
+    setOauthLoading(true);
+    const supabase = createClient();
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: callbackUrl() },
+    });
+    // On success the browser navigates to Google; only reached on error.
+    if (error) { setError(error.message); setOauthLoading(false); }
+  };
+
+  const handleMagicLink = async () => {
+    if (!email) { setError("Enter your email first, then request a magic link."); return; }
+    setError("");
+    setNotice("");
+    setLoading(true);
+    const supabase = createClient();
+    try {
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: callbackUrl() },
+      });
+      if (error) { setError(error.message); return; }
+      setNotice(`We emailed a sign-in link to ${email}. Open it on this device to continue.`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    if (!email) { setError("Enter your email first, then reset your password."); return; }
+    setError("");
+    setNotice("");
+    setLoading(true);
+    const supabase = createClient();
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}`,
+      });
+      if (error) { setError(error.message); return; }
+      setNotice(`Password reset link sent to ${email}. Open it to get back into your account.`);
     } finally {
       setLoading(false);
     }
@@ -83,9 +164,7 @@ export default function LoginPage() {
     await supabase.auth.resend({
       type: "signup",
       email,
-      options: {
-        emailRedirectTo: `${window.location.origin}/auth/callback?next=${next}`,
-      },
+      options: { emailRedirectTo: callbackUrl() },
     });
     setResent(true);
   };
@@ -189,12 +268,12 @@ export default function LoginPage() {
         </div>
 
         <h1 className="font-serif text-xl text-stone-100 font-semibold text-center mb-1">
-          {mode === "signin" ? "Welcome back" : "Create an account"}
+          {mode === "signin" ? "Welcome back" : "Create your LowHigh account"}
         </h1>
         <p className="text-stone-400 text-sm text-center mb-8">
           {mode === "signin"
-            ? "Sign in to sync your archive across devices."
-            : "Save and access your archive from any device."}
+            ? "Sign in with your LowHigh account to scan and sync your archive."
+            : "One LowHigh account works across GraveLens and LowHigh."}
         </p>
 
         {error && (
@@ -202,6 +281,32 @@ export default function LoginPage() {
             {error}
           </div>
         )}
+        {notice && (
+          <div className="w-full mb-4 px-4 py-3 rounded-xl text-sm text-stone-200 bg-stone-800 border border-stone-700">
+            {notice}
+          </div>
+        )}
+
+        {/* Google OAuth */}
+        <button
+          onClick={handleGoogle}
+          disabled={oauthLoading || loading}
+          className="w-full h-12 rounded-xl border border-stone-700 bg-stone-800 text-stone-100 text-sm font-medium flex items-center justify-center gap-2.5 transition-all active:scale-[0.97] disabled:opacity-60"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="#EA4335" d="M12 10.2v3.9h5.5c-.24 1.4-1 2.6-2.1 3.4l3.4 2.6c2-1.8 3.1-4.5 3.1-7.7 0-.7-.06-1.4-.18-2z" transform="translate(0 -1)" />
+            <path fill="#4285F4" d="M12 22c2.7 0 5-1 6.6-2.6l-3.4-2.6c-.95.64-2.16 1-3.2 1-2.5 0-4.6-1.7-5.3-4H3.2v2.5C4.9 19.8 8.2 22 12 22z" />
+            <path fill="#FBBC05" d="M6.7 13.8c-.2-.6-.3-1.2-.3-1.8s.1-1.2.3-1.8V7.7H3.2C2.6 9 2.2 10.4 2.2 12s.4 3 .999 4.3z" />
+            <path fill="#34A853" d="M12 6.4c1.5 0 2.8.5 3.8 1.5l2.9-2.9C16.97 3.4 14.7 2.4 12 2.4 8.2 2.4 4.9 4.6 3.2 7.7l3.5 2.7c.7-2.3 2.8-4 5.3-4z" />
+          </svg>
+          {oauthLoading ? "Redirecting…" : "Continue with Google"}
+        </button>
+
+        <div className="w-full flex items-center gap-3 my-4">
+          <div className="h-px flex-1 bg-stone-800" />
+          <span className="text-stone-600 text-xs">or</span>
+          <div className="h-px flex-1 bg-stone-800" />
+        </div>
 
         <form onSubmit={handleEmailAuth} className="w-full flex flex-col gap-3">
           <input
@@ -224,7 +329,7 @@ export default function LoginPage() {
           />
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || oauthLoading}
             className="w-full h-12 rounded-xl font-semibold text-[#1a1917] text-sm transition-all active:scale-[0.97] disabled:opacity-60"
             style={{ background: "linear-gradient(135deg, var(--t-gold-500), var(--t-gold-400))" }}
           >
@@ -232,10 +337,30 @@ export default function LoginPage() {
           </button>
         </form>
 
+        {/* Secondary email options */}
+        <div className="w-full flex items-center justify-between mt-3 text-sm">
+          <button
+            onClick={handleMagicLink}
+            disabled={loading || oauthLoading}
+            className="text-stone-400 active:text-stone-200 disabled:opacity-60"
+          >
+            Email me a magic link
+          </button>
+          {mode === "signin" && (
+            <button
+              onClick={handleForgotPassword}
+              disabled={loading || oauthLoading}
+              className="text-stone-400 active:text-stone-200 disabled:opacity-60"
+            >
+              Forgot password?
+            </button>
+          )}
+        </div>
+
         <p className="text-stone-500 text-sm mt-6">
           {mode === "signin" ? "Don't have an account? " : "Already have an account? "}
           <button
-            onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setError(""); }}
+            onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setError(""); setNotice(""); }}
             className="text-stone-300 underline"
           >
             {mode === "signin" ? "Sign up" : "Sign in"}
@@ -245,7 +370,7 @@ export default function LoginPage() {
 
       <div className="px-6 text-center">
         <button onClick={() => router.back()} className="text-stone-600 text-sm">
-          Skip for now — stay offline
+          Browse my saved archive
         </button>
       </div>
     </div>

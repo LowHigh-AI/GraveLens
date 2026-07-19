@@ -111,6 +111,22 @@ export async function getGraveCount(): Promise<number> {
   return db.count(STORE_NAME);
 }
 
+/**
+ * Count local graves not yet backed up to the cloud. A grave gets `syncedAt`
+ * set once it has successfully reached Supabase (on capture/edit while online +
+ * signed in, or via a manual Back Up Data run). Scans made offline or while
+ * signed out have no `syncedAt`, so this is the "needs backup" signal used to
+ * enable the Back Up Data action and show the avatar badge.
+ */
+export async function countUnsyncedGraves(): Promise<number> {
+  try {
+    const graves = await getAllGraves();
+    return graves.filter((g) => !g.syncedAt).length;
+  } catch {
+    return 0;
+  }
+}
+
 // ── In-flight analysis results (replaces sessionStorage) ──────────────────
 
 export async function savePendingResult(

@@ -35,3 +35,27 @@ The easiest way to deploy your Next.js app is to use the [Vercel Platform](https
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
 # GraveLens
+
+## Security notes
+
+- **Token-gate enforcement (required in prod):** the per-route token gate
+  (`src/lib/tokenGate.ts`) runs in observe-only mode unless
+  `GRAVELENS_ENFORCE_TOKEN_GATE="true"` is set. Set it in Vercel prod so
+  over-budget users are actually blocked (402). The sliding-window rate limiter
+  (`src/lib/rateLimit.ts`) is the abuse backstop and is always on.
+- **Rate limiter requires the service-role key:** writes go through
+  `SUPABASE_SERVICE_ROLE_KEY` (never the user session), and the
+  `gravelens_rate_limits` table is locked down from the authenticated role so a
+  user cannot reset their own counter. See `db/migrations/gravelens_security_hardening.sql`.
+- **Private photos:** the `grave-photos` bucket is private. Photos are served
+  through `GET /api/photo/[id]`, which enforces owner / public / friend access
+  server-side. Apply the hardening migration to flip the bucket and drop the
+  public-read policy.
+- **DB schema:** the authoritative `gravelens_*` schema + RLS reference lives in
+  `db/schema/gravelens_reference_schema.sql`. The old `supabase-schema.sql` is
+  stale and must not be applied.
+- **CSP:** `next.config.ts` ships a `Content-Security-Policy-Report-Only` header.
+  It pins a sha256 hash of the inline theme bootstrap script in
+  `src/app/layout.tsx` — if that script changes, recompute the hash:
+  `node -e 'const fs=require("fs"),c=require("crypto");const m=fs.readFileSync("src/app/layout.tsx","utf8").match(/__html:\s*\`([\s\S]*?)\`,/);console.log("sha256-"+c.createHash("sha256").update(m[1]).digest("base64"))'`
+  Promote to the enforcing `Content-Security-Policy` header once violations are clean.

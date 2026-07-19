@@ -13,6 +13,7 @@ import {
   saveGrave,
 } from "@/lib/storage";
 import { generateId } from "@/lib/exif";
+import { SCAN_USAGE } from "@/lib/usageActions";
 import { localContrastBoost, unsharpMask } from "@/lib/relief";
 import type { QueuedCapture, ExtractedGraveData, ResearchData, GraveRecord } from "@/types";
 
@@ -103,7 +104,16 @@ async function processItem(item: QueuedCapture): Promise<void> {
       body: JSON.stringify({
         imageBase64: preprocessed.base64,
         mimeType: preprocessed.mimeType,
+        // Label queued scans as "Scan a marker" too. (prompt_id is a uuid column,
+        // and item.id isn't a uuid, so mint one; the cultural summary the result
+        // page auto-loads for a queued grave logs under its own id — acceptable
+        // for this uncommon offline path.)
+        promptId: crypto.randomUUID(),
+        ...SCAN_USAGE,
       }),
+      // Cap a hung connection so the background queue worker can't stall
+      // indefinitely; a timeout throws and the item retries.
+      signal: AbortSignal.timeout(30000),
     });
     if (claudeRes.status === 429) {
       // Respect Retry-After header if present, otherwise back off 15 s
@@ -146,6 +156,7 @@ async function processItem(item: QueuedCapture): Promise<void> {
           inscription: extracted.inscription ?? "",
           symbols: extracted.symbols ?? [],
         }),
+        signal: AbortSignal.timeout(30000),
       });
       if (lookupRes.ok) {
         const d = await lookupRes.json();

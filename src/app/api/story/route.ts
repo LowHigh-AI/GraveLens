@@ -1,6 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { requireAuth } from "@/lib/apiAuth";
+import { admitAiCall } from "@/lib/tokenGate";
+import { requireRateLimit } from "@/lib/rateLimit";
+import { logUsage } from "@/lib/lowhigh";
+import { createClient } from "@/lib/supabase/server";
+import { getAiContentCache, saveAiContentCache, aiContentCacheKey } from "@/lib/researchCache";
 
 const MODEL = "claude-haiku-4-5-20251001";
 const MAX_TOKENS = 700; // 200–250 word output fits well under 700 tokens
@@ -227,11 +232,6 @@ export async function POST(req: NextRequest) {
   const auth = await requireAuth();
   if (auth instanceof NextResponse) return auth;
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return NextResponse.json({ error: "API key missing" }, { status: 500 });
-  }
-
   try {
     const body = await req.json();
 
@@ -251,6 +251,30 @@ export async function POST(req: NextRequest) {
     }
     if (Array.isArray(body.symbolMeanings)) {
       body.symbolMeanings = body.symbolMeanings.slice(0, 20);
+    }
+
+    // ── Shared cache: identical inputs reuse a prior Claude result (no spend) ──
+    const supabase = await createClient();
+    // promptId + tool/component are usage-tracking metadata (the frontend action
+    // that invoked this route), not story inputs — strip them from the cache key.
+    const { promptId: _promptId, tool: _tool, component: _component, ...keyInput } = body;
+    const cacheKey = aiContentCacheKey(keyInput);
+    const cached = await getAiContentCache(supabase, "story", cacheKey).catch(() => null);
+    if (cached) {
+      return NextResponse.json({ ...cached, fromCache: true });
+    }
+
+    // Cache miss — gate tokens/rate, then generate.
+    const admit = await admitAiCall(auth.userId, "story");
+    if (admit.response) return admit.response;
+    if (admit.release) after(admit.release);
+
+    const rl = await requireRateLimit(auth.userId, "story");
+    if (rl) return rl;
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: "API key missing" }, { status: 500 });
     }
 
     const client = new Anthropic({ apiKey });
@@ -294,6 +318,24 @@ export async function POST(req: NextRequest) {
         );
       }
     }
+
+    // Persist the generated content for reuse by any future identical request.
+    after(() => saveAiContentCache(supabase, "story", cacheKey, parsed).catch(() => {}));
+
+    after(() =>
+      logUsage(auth.userId, {
+        endpoint: "/api/story",
+        provider: "anthropic",
+        modelId: `anthropic/${MODEL}`,
+        model: MODEL,
+        requestType: "story",
+        inputTokens: message.usage?.input_tokens ?? null,
+        outputTokens: message.usage?.output_tokens ?? null,
+        promptId: typeof body.promptId === "string" && body.promptId ? body.promptId : crypto.randomUUID(),
+        tool: typeof body.tool === "string" && body.tool ? body.tool : "Story",
+        component: typeof body.component === "string" && body.component ? body.component : "Generate Story",
+      })
+    );
 
     return NextResponse.json(parsed);
   } catch (error: unknown) {

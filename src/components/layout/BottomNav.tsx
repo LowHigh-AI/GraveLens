@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { haptic } from "@/lib/haptic";
-import { recordActiveDay } from "@/lib/achievements";
+import { recordActiveDay, unseenCount, ACHIEVEMENT_UNSEEN_EVENT } from "@/lib/achievements";
 import { getQueueCount } from "@/lib/storage";
 import { startQueueProcessor, QUEUE_CHANGED_EVENT } from "@/lib/queue";
 import { setPendingCaptureFile } from "@/lib/pendingCapture";
@@ -84,9 +84,8 @@ const rightTabs = [
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <circle cx="12" cy="8" r="4" />
-        <path d="M8 8H4l2 8h12l2-8h-4" />
-        <path d="M9 16l1 4h4l1-4" />
+        <circle cx="12" cy="12" r="10" />
+        <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
       </svg>
     ),
   },
@@ -96,6 +95,7 @@ export default function BottomNav() {
   const pathname = usePathname();
   const router = useRouter();
   const [queueCount, setQueueCount] = useState(0);
+  const [unseen, setUnseen] = useState(0);
   const cameraInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -108,10 +108,16 @@ export default function BottomNav() {
     };
     window.addEventListener(QUEUE_CHANGED_EVENT, onQueueChanged);
 
+    // Explorer "unseen unlocks" badge — recompute on unlock/view/cloud-merge.
+    const refreshUnseen = () => setUnseen(unseenCount());
+    refreshUnseen();
+    window.addEventListener(ACHIEVEMENT_UNSEEN_EVENT, refreshUnseen);
+
     const cleanup = startQueueProcessor();
 
     return () => {
       window.removeEventListener(QUEUE_CHANGED_EVENT, onQueueChanged);
+      window.removeEventListener(ACHIEVEMENT_UNSEEN_EVENT, refreshUnseen);
       cleanup();
     };
   }, []);
@@ -202,15 +208,25 @@ export default function BottomNav() {
             const isActive =
               pathname === tab.href || pathname.startsWith(tab.href + "/");
 
+            const showBadge = tab.href === "/explorer" && unseen > 0;
+
             return (
               <Link
                 key={tab.href}
                 href={tab.href}
-                aria-label={tab.label}
+                aria-label={showBadge ? `${tab.label}, ${unseen} new` : tab.label}
                 aria-current={isActive ? "page" : undefined}
                 className={`relative flex flex-col items-center justify-center w-[64px] h-[64px] rounded-[32px] transition-all duration-300 active:scale-95 ${isActive ? 'bg-white/10 shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)]' : 'hover:bg-white/5'}`}
               >
                 {tab.icon(isActive)}
+                {showBadge && (
+                  <span
+                    className="absolute top-1 right-1 min-w-[16px] h-4 rounded-full text-[0.75rem] font-bold flex items-center justify-center px-1"
+                    style={{ background: "var(--t-gold-500)", color: "#1a1917" }}
+                  >
+                    {unseen > 9 ? "9+" : unseen}
+                  </span>
+                )}
                 <span
                   className="text-[0.75rem] font-bold tracking-wide uppercase mt-1 transition-colors"
                   style={{ color: isActive ? "var(--t-gold-500)" : "var(--t-stone-500)", textShadow: "none" }}

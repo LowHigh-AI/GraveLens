@@ -1,6 +1,7 @@
 "use client";
 
 import "leaflet/dist/leaflet.css";
+import "leaflet.markercluster/dist/MarkerCluster.css";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { GraveRecord, NotableFigure, CommunityGraveRecord } from "@/types";
 import { getNotableFiguresInBounds } from "@/lib/apis/wikidata";
@@ -84,6 +85,12 @@ const VISITED_ICON_HTML = `
 
 // ── Zoom-tier helpers ─────────────────────────────────────────────────────────
 
+// Largest bbox (degrees) we'll send to Overpass in one "Search Here". Beyond this
+// the cemetery query returns too much and times out, so we clamp to a centered box
+// of this size rather than rejecting the search.
+const MAX_SEARCH_LAT_DEG = 1.2;
+const MAX_SEARCH_LNG_DEG = 1.5;
+
 function wikidataMinSitelinks(zoom: number): number {
   if (zoom >= 13) return 2;
   if (zoom >= 10) return 15;
@@ -97,7 +104,8 @@ async function fetchCemeteriesInBounds(
   south: number,
   west: number,
   north: number,
-  east: number
+  east: number,
+  signal?: AbortSignal
 ): Promise<CemeteryFeature[]> {
   const query = `
 [out:json][timeout:15];
@@ -112,7 +120,7 @@ async function fetchCemeteriesInBounds(
   way["historic"="cemetery"](${south},${west},${north},${east});
   relation["historic"="cemetery"](${south},${west},${north},${east});
 );
-out center tags;
+out center tags 200;
 `.trim();
 
   try {
@@ -120,7 +128,7 @@ out center tags;
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(18000),
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(18000), signal]) : AbortSignal.timeout(18000),
     });
     if (!res.ok) return [];
 
@@ -144,7 +152,10 @@ out center tags;
     }
     const seen = new Set<string>();
     return results.filter((c) => { if (seen.has(c.name)) return false; seen.add(c.name); return true; });
-  } catch {
+  } catch (err) {
+    // A caller-initiated cancellation must propagate so a superseded search
+    // doesn't clobber the newer one's results; timeouts degrade to empty.
+    if ((err as Error)?.name === "AbortError") throw err;
     return [];
   }
 }
@@ -156,7 +167,8 @@ async function fetchHeritageInBounds(
   west: number,
   north: number,
   east: number,
-  zoom: number
+  zoom: number,
+  signal?: AbortSignal
 ): Promise<HeritagePlace[]> {
   const bb = `(${south},${west},${north},${east})`;
 
@@ -190,7 +202,7 @@ async function fetchHeritageInBounds(
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(15000),
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(15000), signal]) : AbortSignal.timeout(15000),
     });
     if (!res.ok) return [];
 
@@ -213,7 +225,8 @@ async function fetchHeritageInBounds(
       results.push({ lat, lng, name, type, wikipedia });
     }
     return results;
-  } catch {
+  } catch (err) {
+    if ((err as Error)?.name === "AbortError") throw err;
     return [];
   }
 }
@@ -228,6 +241,45 @@ function getUserLocation(): Promise<[number, number] | null> {
       () => resolve(null),
       { timeout: 6000, maximumAge: 60000 }
     );
+  });
+}
+
+// ── Cluster icon factory ──────────────────────────────────────────────────────
+// Builds the divIcon shown for a marker cluster, themed to match the map
+// (gold for the user's graves, purple for shared/community graves).
+function makeClusterIcon(L: typeof import("leaflet"), accent: string) {
+  return (cluster: import("leaflet").MarkerCluster) => {
+    const count = cluster.getChildCount();
+    const size = count < 10 ? 34 : count < 100 ? 40 : 46;
+    const fontSize = count < 100 ? "0.85rem" : "0.72rem";
+    return L.divIcon({
+      html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:#1a1917;border:2.5px solid ${accent};display:flex;align-items:center;justify-content:center;color:${accent};font-family:system-ui;font-weight:700;font-size:${fontSize};box-shadow:0 2px 8px rgba(0,0,0,0.5);">${count}</div>`,
+      className: "",
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+    });
+  };
+}
+
+// ── Lazy popup photo ──────────────────────────────────────────────────────────
+// Instead of embedding (often large base64) photos in every bound popup's HTML,
+// inject the <img> only when the popup actually opens, and release it on close.
+// The popup HTML must contain a `<div class="gl-popup-photo">` placeholder.
+function bindLazyPhoto(marker: import("leaflet").Marker, photoSrc?: string) {
+  if (!photoSrc) return;
+  marker.on("popupopen", (e: import("leaflet").PopupEvent) => {
+    const box = e.popup.getElement()?.querySelector<HTMLElement>(".gl-popup-photo");
+    if (box && !box.firstChild) {
+      const img = document.createElement("img");
+      img.src = photoSrc;
+      img.loading = "lazy";
+      img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+      box.appendChild(img);
+    }
+  });
+  marker.on("popupclose", (e: import("leaflet").PopupEvent) => {
+    const box = e.popup.getElement()?.querySelector<HTMLElement>(".gl-popup-photo");
+    if (box) box.innerHTML = "";
   });
 }
 
@@ -257,6 +309,7 @@ export default function ArchiveMap({
   findTrigger,
   userLocation,
   onSearchStateChange,
+  onSearchNotice,
   onClearFind,
 }: {
   graves: GraveRecord[];
@@ -267,15 +320,18 @@ export default function ArchiveMap({
   findTrigger: number;
   userLocation: [number, number] | null;
   onSearchStateChange: (searching: boolean, hasResults: boolean) => void;
+  /** Transient, non-blocking notice (e.g. clamped-to-center). null clears it. */
+  onSearchNotice?: (message: string | null) => void;
   onClearFind: () => void;
 }) {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<import("leaflet").Map | null>(null);
   const leafletRef = useRef<typeof import("leaflet") | null>(null);
-  const graveLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
-  const communityLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
+  const graveLayerRef = useRef<import("leaflet").MarkerClusterGroup | null>(null);
+  const communityLayerRef = useRef<import("leaflet").MarkerClusterGroup | null>(null);
   const overlayLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
   const userMarkerRef = useRef<import("leaflet").Marker | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
   const [mapReady, setMapReady] = useState(false);
 
   // Search results state
@@ -295,7 +351,6 @@ export default function ArchiveMap({
   const visitedCemeteries = useMemo(() => {
     const stores = new Map<string, { lat: number; lng: number; name: string; count: number }>();
     allGraves.forEach((g) => {
-      if (!g.location?.lat || !g.location?.lng) return;
       const cName = g.location.cemetery || "Unknown Location";
       const key = cName.toLowerCase().trim();
       const existing = stores.get(key);
@@ -313,7 +368,9 @@ export default function ArchiveMap({
     return Array.from(stores.values());
   }, [allGraves]);
 
-  const hasManualResults = !!(manualFigures || manualCemeteries || manualRelatives);
+  const hasManualResults = !!(
+    manualFigures?.length || manualCemeteries?.length || manualRelatives?.length || heritagePlaces.length
+  );
 
   useEffect(() => { onSearchStateChange(isSearching, hasManualResults); }, [isSearching, hasManualResults, onSearchStateChange]);
 
@@ -324,6 +381,9 @@ export default function ArchiveMap({
 
     (async () => {
       const L = (await import("leaflet")).default ?? await import("leaflet");
+      // Side-effect import: augments L with L.markerClusterGroup(). Must run in
+      // the browser after Leaflet loads, so it lives here rather than at module top.
+      await import("leaflet.markercluster");
       leafletRef.current = L;
       if (cancelled || !mapRef.current) return;
 
@@ -340,10 +400,7 @@ export default function ArchiveMap({
       if (userPos) {
         center = userPos;
         zoom = 14;
-      } else if (validGraves.length === 1) {
-        center = [validGraves[0].location.lat, validGraves[0].location.lng];
-        zoom = 17; // Zoom close enough for the marker pin to render immediately
-      } else if (validGraves.length > 1) {
+      } else if (validGraves.length > 0) {
         center = [validGraves[0].location.lat, validGraves[0].location.lng];
         zoom = 14;
       }
@@ -351,26 +408,31 @@ export default function ArchiveMap({
       const map = L.map(mapRef.current!, { center, zoom, zoomControl: false });
       mapInstanceRef.current = map;
 
-      if (!userPos && validGraves.length > 1) {
-        const bounds = L.latLngBounds(validGraves.map((g) => [g.location.lat, g.location.lng] as [number, number]));
-        map.fitBounds(bounds, { padding: [40, 40] });
-      }
-
       L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
         attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
         maxZoom: 19,
       }).addTo(map);
 
-      graveLayerRef.current = L.layerGroup().addTo(map);
-      communityLayerRef.current = L.layerGroup().addTo(map);
+      const clusterOptions = {
+        maxClusterRadius: 50,
+        showCoverageOnHover: false,
+        spiderfyOnMaxZoom: true,
+        chunkedLoading: true,
+      };
+      graveLayerRef.current = L.markerClusterGroup({
+        ...clusterOptions,
+        iconCreateFunction: makeClusterIcon(L, "var(--t-gold-500)"),
+      }).addTo(map);
+      communityLayerRef.current = L.markerClusterGroup({
+        ...clusterOptions,
+        iconCreateFunction: makeClusterIcon(L, "#a855f7"),
+      }).addTo(map);
       overlayLayerRef.current = L.layerGroup().addTo(map);
 
       map.on("zoomend", () => {
         setCurrentZoom(map.getZoom());
       });
 
-      // Sync React zoom state with map initialization zoom
-      setCurrentZoom(map.getZoom());
       setMapReady(true); // ← signals layer effects to run
     })();
 
@@ -458,7 +520,7 @@ export default function ArchiveMap({
             <a href="/result/${grave.id}" style="text-decoration:none;display:block;">
               <p style="font-family:Georgia,serif;font-size:1rem;font-weight:600;color:var(--t-stone-50);margin:0 0 2px;">${name}</p>
               ${dates ? `<p style="font-size:0.75rem;color:var(--t-gold-500);margin:0 0 6px;">${dates}</p>` : ""}
-              <img src="${grave.photoDataUrl}" style="width:100%;height:80px;object-fit:cover;border-radius:8px;margin-bottom:8px;" />
+              <div class="gl-popup-photo" style="width:100%;height:80px;border-radius:8px;margin-bottom:8px;background:var(--t-stone-800);overflow:hidden;"></div>
               <div style="font-size:0.7rem;font-weight:700;color:var(--t-gold-500);text-transform:uppercase;letter-spacing:0.5px;display:flex;align-items:center;justify-content:center;gap:4px;margin-bottom:8px;">
                 View Archive Entry
                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -480,9 +542,10 @@ export default function ArchiveMap({
             </div>
             ${wikiUrl ? `<a href="${wikiUrl}" target="_blank" style="display:block;padding:6px;background:var(--t-gold-500);color:#1a1917;text-align:center;border-radius:8px;font-size:0.7rem;font-weight:700;text-decoration:none;">Search Wikipedia →</a>` : ""}
           </div>`;
-        L.marker([grave.location.lat, grave.location.lng], { icon: graveIcon })
+        const marker = L.marker([grave.location.lat, grave.location.lng], { icon: graveIcon })
           .addTo(layer)
           .bindPopup(popup, { autoPan: false });
+        bindLazyPhoto(marker, grave.photoDataUrl);
       });
 
       if (validGraves.length > 1 && map.getZoom() <= 5) {
@@ -525,10 +588,7 @@ export default function ArchiveMap({
           </div>`;
         L.marker([c.lat, c.lng], { icon: visitedIcon })
           .addTo(layer)
-          .bindPopup(popup, { autoPan: false })
-          .on("click", () => {
-            map.setView([c.lat, c.lng], 16);
-          });
+          .bindPopup(popup, { autoPan: false });
       });
     }
   }, [graves, visitedCemeteries, currentZoom, mapReady]);
@@ -574,7 +634,7 @@ export default function ArchiveMap({
           <p style="font-family:Georgia,serif;font-size:1rem;font-weight:600;color:var(--t-stone-50);margin:0 0 2px;">${g.name}</p>
           ${dates ? `<p style="font-size:0.75rem;color:#a855f7;margin:0 0 4px;">${dates}</p>` : ""}
           ${g.cemetery ? `<p style="font-size:0.7rem;color:var(--t-stone-500);margin:0 0 4px;">${g.cemetery}</p>` : ""}
-          <img src="${g.photoUrl}" style="width:100%;height:80px;object-fit:cover;border-radius:8px;margin-bottom:8px;" />
+          <div class="gl-popup-photo" style="width:100%;height:80px;border-radius:8px;margin-bottom:8px;background:var(--t-stone-800);overflow:hidden;"></div>
           <p style="font-size:0.7rem;color:var(--t-stone-500);margin:0 0 8px;">${g.contributorLabel} · ${rankLabel}</p>
           ${g.communityNote ? `<p style="font-size:0.7rem;color:#d0cbc5;margin:0 0 8px;font-style:italic;">"${g.communityNote}"</p>` : ""}
           <div style="display:flex;gap:6px;margin-bottom:6px;">
@@ -591,9 +651,10 @@ export default function ArchiveMap({
           </div>
           ${wikiUrl ? `<a href="${wikiUrl}" target="_blank" style="display:block;padding:6px;background:var(--t-gold-500);color:#1a1917;text-align:center;border-radius:8px;font-size:0.7rem;font-weight:700;text-decoration:none;">Search Wikipedia →</a>` : ""}
         </div>`;
-      L.marker([g.lat, g.lng], { icon })
+      const marker = L.marker([g.lat, g.lng], { icon })
         .addTo(layer)
         .bindPopup(popup, { autoPan: false });
+      bindLazyPhoto(marker, g.photoUrl);
     });
   }, [communityGraves, mapReady]);
 
@@ -710,9 +771,10 @@ export default function ArchiveMap({
         const html = `<div style="font-family:system-ui;min-width:160px;padding:10px;text-align:center;">
           <p style="font-family:Georgia,serif;font-size:1rem;font-weight:600;color:var(--t-stone-50);margin:0 0 4px;">${name}</p>
           ${cemetery ? `<p style="font-size:0.75rem;color:var(--t-gold-500);margin:0;">${cemetery}</p>` : ""}
-          <img src="${g.photoDataUrl}" style="width:100%;height:72px;object-fit:cover;border-radius:10px;margin-top:6px;" />
+          <div class="gl-popup-photo" style="width:100%;height:72px;border-radius:10px;margin-top:6px;background:var(--t-stone-800);overflow:hidden;"></div>
         </div>`;
-        L.marker([g.location.lat, g.location.lng], { icon }).addTo(layer).bindPopup(html, { autoPan: false });
+        const marker = L.marker([g.location.lat, g.location.lng], { icon }).addTo(layer).bindPopup(html, { autoPan: false });
+        bindLazyPhoto(marker, g.photoDataUrl);
       });
     }
   }, [heritagePlaces, manualFigures, manualCemeteries, manualRelatives, mapReady, activeFilters, visitedCemeteries]);
@@ -727,6 +789,12 @@ export default function ArchiveMap({
   const handleFind = async () => {
     const map = mapInstanceRef.current;
     if (!map) return;
+
+    // Cancel any in-flight search so a slower prior request can't clobber this one.
+    searchAbortRef.current?.abort();
+    const ac = new AbortController();
+    searchAbortRef.current = ac;
+
     setIsSearching(true);
     try {
       const center = map.getCenter();
@@ -740,22 +808,22 @@ export default function ArchiveMap({
       const promises: Promise<void>[] = [];
 
       promises.push(
-        fetchCemeteriesInBounds(s, w, n, e)
+        fetchCemeteriesInBounds(s, w, n, e, ac.signal)
           .then(setManualCemeteries)
-          .catch(() => setManualCemeteries(null))
+          .catch((err: unknown) => { if ((err as Error)?.name === "AbortError") throw err; setManualCemeteries(null); })
       );
 
       promises.push(
-        getNotableFiguresInBounds(s, w, n, e, wikidataMinSitelinks(zoom))
+        getNotableFiguresInBounds(s, w, n, e, wikidataMinSitelinks(zoom), ac.signal)
           .then(setManualFigures)
-          .catch(() => setManualFigures(null))
+          .catch((err: unknown) => { if ((err as Error)?.name === "AbortError") throw err; setManualFigures(null); })
       );
 
       if (zoom >= 8) {
         promises.push(
-          fetchHeritageInBounds(s, w, n, e, zoom)
+          fetchHeritageInBounds(s, w, n, e, zoom, ac.signal)
             .then(setHeritagePlaces)
-            .catch(() => setHeritagePlaces([]))
+            .catch((err: unknown) => { if ((err as Error)?.name === "AbortError") throw err; setHeritagePlaces([]); })
         );
       } else {
         setHeritagePlaces([]);
@@ -773,8 +841,11 @@ export default function ArchiveMap({
 
       await Promise.all(promises);
       map.fitBounds([[s, w], [n, e]], { padding: [20, 20] });
+    } catch (err) {
+      // Aborted by a newer search — let that one own the UI state.
+      if ((err as Error)?.name === "AbortError") return;
     } finally {
-      setIsSearching(false);
+      if (searchAbortRef.current === ac) { searchAbortRef.current = null; setIsSearching(false); }
     }
   };
 
@@ -794,14 +865,27 @@ export default function ArchiveMap({
     const sw = b.getSouthWest();
     const ne = b.getNorthEast();
 
-    // Prevent huge queries over large regions
-    if (Math.abs(ne.lat - sw.lat) > 1.2 || Math.abs(ne.lng - sw.lng) > 1.5) {
-      alert("Search area is too large. Please zoom in to search.");
-      return;
+    // If the viewport is larger than Overpass can handle in one query, clamp to a
+    // safe-sized box centered on the map rather than rejecting the search.
+    const center = map.getCenter();
+    const latSpan = Math.abs(ne.lat - sw.lat);
+    const lngSpan = Math.abs(ne.lng - sw.lng);
+    const clamped = latSpan > MAX_SEARCH_LAT_DEG || lngSpan > MAX_SEARCH_LNG_DEG;
+    let s = sw.lat, w = sw.lng, n = ne.lat, e = ne.lng;
+    if (clamped) {
+      const halfLat = Math.min(latSpan, MAX_SEARCH_LAT_DEG) / 2;
+      const halfLng = Math.min(lngSpan, MAX_SEARCH_LNG_DEG) / 2;
+      s = center.lat - halfLat; n = center.lat + halfLat;
+      w = center.lng - halfLng; e = center.lng + halfLng;
     }
 
+    // Cancel any in-flight search so a slower prior request can't clobber this one.
+    searchAbortRef.current?.abort();
+    const ac = new AbortController();
+    searchAbortRef.current = ac;
+
     setIsSearching(true);
-    
+
     // Clear old state so legend and map accurately reflect a fresh search
     setManualFigures(null);
     setManualCemeteries(null);
@@ -809,50 +893,75 @@ export default function ArchiveMap({
     setManualRelatives(null);
 
     try {
-      const sw = b.getSouthWest();
-      const ne = b.getNorthEast();
       const z = map.getZoom();
 
+      // Track per-query outcome so the post-search notice can distinguish a
+      // genuine empty area from a service failure (timeout / 429 / network),
+      // which otherwise look identical to the user. A non-abort rejection from
+      // any query flips `anyError`; AbortError still propagates so a superseded
+      // search can't clobber the newer one's UI state.
+      let anyError = false;
+      let cemeteriesCapped = false;
+      // Result counts captured locally (state setters are async and can't be
+      // read back synchronously to decide the post-search message).
+      let cemCount = 0, figCount = 0, heritageCount = 0;
       const tasks: Promise<void>[] = [];
 
       tasks.push(
-        fetchCemeteriesInBounds(sw.lat, sw.lng, ne.lat, ne.lng)
-          .then(setManualCemeteries)
-          .catch(() => setManualCemeteries(null))
+        fetchCemeteriesInBounds(s, w, n, e, ac.signal)
+          .then((r) => { cemCount = r.length; cemeteriesCapped = r.length >= 200; setManualCemeteries(r); })
+          .catch((err: unknown) => { if ((err as Error)?.name === "AbortError") throw err; anyError = true; setManualCemeteries(null); })
       );
 
       tasks.push(
-        getNotableFiguresInBounds(sw.lat, sw.lng, ne.lat, ne.lng, wikidataMinSitelinks(z))
-          .then(setManualFigures)
-          .catch(() => setManualFigures(null))
+        getNotableFiguresInBounds(s, w, n, e, wikidataMinSitelinks(z), ac.signal)
+          .then((r) => { figCount = r.length; setManualFigures(r); })
+          .catch((err: unknown) => { if ((err as Error)?.name === "AbortError") throw err; anyError = true; setManualFigures(null); })
       );
 
       if (z >= 8) {
         tasks.push(
-          fetchHeritageInBounds(sw.lat, sw.lng, ne.lat, ne.lng, z)
-            .then(setHeritagePlaces)
-            .catch(() => setHeritagePlaces([]))
+          fetchHeritageInBounds(s, w, n, e, z, ac.signal)
+            .then((r) => { heritageCount = r.length; setHeritagePlaces(r); })
+            .catch((err: unknown) => { if ((err as Error)?.name === "AbortError") throw err; anyError = true; setHeritagePlaces([]); })
         );
       } else {
         setHeritagePlaces([]);
       }
 
-      setManualRelatives(
-        allGraves.filter(
-          (g) =>
-            g.location?.lat &&
-            g.location.lat >= sw.lat && g.location.lat <= ne.lat &&
-            g.location.lng >= sw.lng && g.location.lng <= ne.lng &&
-            (g.tags || []).some((t) => RELATIVE_TAGS.includes(t.toLowerCase()))
-        )
+      const relatives = allGraves.filter(
+        (g) =>
+          g.location?.lat &&
+          g.location.lat >= s && g.location.lat <= n &&
+          g.location.lng >= w && g.location.lng <= e &&
+          (g.tags || []).some((t) => RELATIVE_TAGS.includes(t.toLowerCase()))
       );
+      setManualRelatives(relatives);
 
       await Promise.all(tasks);
-      onSearchStateChange(false, true);
-    } catch {
-      onSearchStateChange(false, false);
+
+      // Single prioritized post-search notice. This is the only place that drives
+      // the search toast, so failure / cap / clamp / empty messages don't clobber
+      // each other in the shared single-slot toast (see MapPage).
+      const hasResults = !!(figCount || cemCount || relatives.length || heritageCount);
+      if (anyError) {
+        onSearchNotice?.(hasResults
+          ? "Search service is busy — some results may be missing. Try again."
+          : "Search service is busy — try again.");
+      } else if (cemeteriesCapped) {
+        onSearchNotice?.("Showing the first 200 cemeteries; zoom in for complete results.");
+      } else if (clamped) {
+        onSearchNotice?.("Showing results near the center of the view.");
+      } else if (!hasResults) {
+        onSearchNotice?.("No results found in this area — try zooming out or moving the map.");
+      } else {
+        onSearchNotice?.(null);
+      }
+    } catch (err) {
+      // Aborted by a newer search — let that one own the UI state.
+      if ((err as Error)?.name === "AbortError") return;
     } finally {
-      setIsSearching(false);
+      if (searchAbortRef.current === ac) { searchAbortRef.current = null; setIsSearching(false); }
     }
   };
 

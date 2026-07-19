@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/apiAuth";
+import { requireRateLimit } from "@/lib/rateLimit";
 import { searchFamilySearchHints } from "@/lib/apis/familysearch";
 
 export async function POST(req: NextRequest) {
   const auth = await requireAuth();
   if (auth instanceof NextResponse) return auth;
+
+  const rl = await requireRateLimit(auth.userId, "genealogy");
+  if (rl) return rl;
 
   try {
     const body = await req.json().catch(() => null);

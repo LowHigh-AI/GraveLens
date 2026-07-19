@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import Link from "next/link";
 import PageShell from "@/components/layout/PageShell";
 import {
   ACHIEVEMENTS,
@@ -13,27 +15,23 @@ import {
   loadUnlocks,
   loadStats,
   isUnlocked,
+  unseenUnlocks,
+  markUnlocksSeen,
   type Achievement,
   type UnlockRecord,
   type AchievementCategory,
 } from "@/lib/achievements";
+import { pushExplorerPoints } from "@/lib/cloudSync";
 import { getAllGraves } from "@/lib/storage";
 import type { GraveRecord, UserProfile } from "@/types";
 import { RankInsignia } from "@/components/ui/RankInsignia";
 import { useAuth } from "@/lib/auth";
+import { useEcosystem } from "@/components/ecosystem/EcosystemProvider";
 import { createClient } from "@/lib/supabase/browser";
 import { SHOW_COMMUNITY_FEATURES } from "@/lib/config";
-
-const CATEGORY_ICONS: Record<AchievementCategory, string> = {
-  "First Steps": "🪦",
-  "Collection": "📚",
-  "Exploration": "🧭",
-  "Through the Ages": "⏳",
-  "Military": "🎖️",
-  "Family": "🌳",
-  "Research": "🔍",
-  "Discovery": "✨",
-};
+import { AchievementGlyph } from "@/components/achievements/achievementIcons";
+import { Users, Gift, X, Sparkles } from "lucide-react";
+import { formatTokens } from "@/lib/lowhighClient";
 
 function RankBadge({ level }: { level: number }) {
   const isMax = level === 10;
@@ -90,25 +88,28 @@ function AchievementCard({
       style={{
         background: unlocked
           ? "linear-gradient(135deg, var(--t-stone-800), var(--t-stone-900))"
-          : "rgba(var(--glass-bg-rgb), 0.6)",
+          : "rgba(var(--glass-bg-rgb), 0.85)",
         border: unlocked
           ? "1px solid rgba(201,168,76,0.4)"
           : "1px solid var(--t-stone-700)",
         boxShadow: unlocked ? "0 0 12px rgba(201,168,76,0.12)" : "none",
-        opacity: !unlocked && progress === 0 ? 0.5 : 1,
       }}
     >
       {/* Icon */}
       <div
-        className="text-2xl w-10 h-10 flex items-center justify-center rounded-lg shrink-0"
+        className="w-10 h-10 flex items-center justify-center rounded-lg shrink-0"
         style={{
           background: unlocked
             ? "rgba(201,168,76,0.15)"
             : "rgba(255,255,255,0.04)",
-          filter: !unlocked && progress === 0 ? "grayscale(1)" : "none",
         }}
       >
-        {achievement.icon}
+        <AchievementGlyph
+          id={achievement.id}
+          size={20}
+          strokeWidth={1.75}
+          color={unlocked ? "var(--t-gold-500)" : "#8a8580"}
+        />
       </div>
 
       {/* Content */}
@@ -124,7 +125,7 @@ function AchievementCard({
             className="text-[0.75rem] font-bold shrink-0 px-1.5 py-0.5 rounded"
             style={{
               background: unlocked ? "rgba(201,168,76,0.2)" : "rgba(255,255,255,0.06)",
-              color: unlocked ? "var(--t-gold-500)" : "#6a6560",
+              color: unlocked ? "var(--t-gold-500)" : "var(--t-stone-400)",
             }}
           >
             +{achievement.xp} XP
@@ -153,7 +154,7 @@ function AchievementCard({
                 }}
               />
             </div>
-            <p className="text-[0.75rem] text-stone-600 mt-0.5">{label}</p>
+            <p className="text-[0.75rem] text-stone-400 mt-0.5">{label}</p>
           </div>
         )}
 
@@ -167,7 +168,7 @@ function AchievementCard({
           </div>
         )}
         {!unlocked && (
-          <p className="text-[0.75rem] text-stone-700 mt-1.5">Tap to see how to earn this</p>
+          <p className="text-[0.75rem] text-stone-400 mt-1.5">Tap to see how to earn this</p>
         )}
       </div>
     </button>
@@ -190,34 +191,50 @@ function AchievementDetailSheet({
   label: string;
   onClose: () => void;
 }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-end" onClick={onClose}>
+  // Portal to document.body so `fixed inset-0` is viewport-relative and immune to
+  // the PageShell layout/stacking context — matching every other modal in the app.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+
+  // Backdrop covers the whole viewport (incl. sidebar); the card centers within
+  // the content column. lg:pl-60 = desktop sidebar (pl-56 / 224px) + the Explorer
+  // main's px-4 (16px), so the card lines up with the centered content panel.
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 lg:pl-60" onClick={onClose}>
       <div className="absolute inset-0 bg-black/70" />
       <div
-        className="relative w-full max-w-lg mx-auto rounded-t-3xl animate-fade-up"
+        className="relative w-full max-w-lg max-h-[90dvh] overflow-y-auto rounded-3xl animate-in fade-in zoom-in-95 duration-200"
         style={{
           background: "linear-gradient(160deg, var(--t-stone-900), var(--t-stone-800))",
           border: "1px solid rgba(201,168,76,0.2)",
-          paddingBottom: "max(2rem, env(safe-area-inset-bottom))",
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Drag handle */}
-        <div className="w-10 h-1 bg-stone-600 rounded-full mx-auto mt-3 mb-6" />
-
-        <div className="px-6">
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          className="absolute top-3 right-3 z-10 w-8 h-8 inline-flex items-center justify-center rounded-full text-stone-400 hover:text-stone-100 hover:bg-stone-800/60 transition-colors"
+        >
+          <X size={18} />
+        </button>
+        <div className="px-6 py-6">
           {/* Icon + category */}
-          <div className="flex items-start justify-between mb-5">
+          <div className="flex items-start justify-between mb-5 pr-9">
             <div
-              className="text-4xl w-16 h-16 flex items-center justify-center rounded-2xl"
+              className="w-16 h-16 flex items-center justify-center rounded-2xl"
               style={{
                 background: unlocked
                   ? "rgba(201,168,76,0.18)"
                   : "rgba(255,255,255,0.05)",
-                filter: !unlocked ? "grayscale(0.6)" : "none",
               }}
             >
-              {achievement.icon}
+              <AchievementGlyph
+                id={achievement.id}
+                size={30}
+                strokeWidth={1.5}
+                color={unlocked ? "var(--t-gold-500)" : "#7a756f"}
+              />
             </div>
             <div className="text-right">
               <span
@@ -234,7 +251,7 @@ function AchievementDetailSheet({
                   className="text-sm font-bold px-2.5 py-1 rounded-lg"
                   style={{
                     background: unlocked ? "rgba(201,168,76,0.2)" : "rgba(255,255,255,0.06)",
-                    color: unlocked ? "var(--t-gold-200)" : "#6a6560",
+                    color: unlocked ? "var(--t-gold-200)" : "#8a8580",
                   }}
                 >
                   +{achievement.xp} XP
@@ -277,7 +294,7 @@ function AchievementDetailSheet({
                 className="w-5 h-5 rounded-full flex items-center justify-center"
                 style={{ background: "rgba(255,255,255,0.05)" }}
               >
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#6a6560" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#8a8580" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                   <path d="M7 11V7a5 5 0 0 1 10 0v4" />
                 </svg>
@@ -331,30 +348,25 @@ function AchievementDetailSheet({
             </p>
           </div>
 
-          <button
-            onClick={onClose}
-            className="w-full mt-5 h-12 rounded-2xl text-stone-400 text-sm border border-stone-700"
-          >
-            Close
-          </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
 // ── Friend profile card ────────────────────────────────────────────────────
 function FriendCard({ profile }: { profile: UserProfile }) {
   const rank = getRank(profile.explorerXp);
-  const displayName = profile.showUsername && profile.username
-    ? `@${profile.username}`
-    : profile.displayName || "Explorer";
+  const displayName = profile.showUsername && profile.displayName
+    ? profile.displayName
+    : "Community Member";
 
   return (
     <div
       className="flex items-center gap-3 rounded-xl p-3"
       style={{
-        background: "rgba(var(--glass-bg-rgb), 0.7)",
+        background: "rgba(var(--glass-bg-rgb), 0.85)",
         border: "1px solid var(--t-stone-700)",
       }}
     >
@@ -362,7 +374,7 @@ function FriendCard({ profile }: { profile: UserProfile }) {
         className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 text-lg font-bold font-serif"
         style={{ background: "rgba(201,168,76,0.12)", border: "1px solid rgba(201,168,76,0.25)", color: "var(--t-gold-500)" }}
       >
-        {displayName.replace("@", "").slice(0, 1).toUpperCase()}
+        {displayName.slice(0, 1).toUpperCase()}
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-stone-200 text-sm font-semibold truncate">{displayName}</p>
@@ -374,12 +386,23 @@ function FriendCard({ profile }: { profile: UserProfile }) {
 }
 
 export default function AchievementsPage() {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
+  // Tri-state: only treat as signed out once auth has resolved, so we don't flash
+  // the sign-in prompt at a user whose session is still loading.
+  const signedOut = !authLoading && !user;
+  const eco = useEcosystem();
   const [graves, setGraves] = useState<GraveRecord[]>([]);
   const [unlocks, setUnlocks] = useState<UnlockRecord[]>([]);
+  const [justUnlocked, setJustUnlocked] = useState<Achievement[]>([]);
+  const [needsSeenPush, setNeedsSeenPush] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<AchievementCategory | null>(null);
+  // Claimable rank-reward tokens — derived from the shared goals in context (no
+  // separate /api/goals fetch), drives the "claim" nudge.
+  const rankClaimable = (eco?.goals ?? [])
+    .filter((g) => g.slug.startsWith("gravelens_rank_") && g.status === "claimable")
+    .reduce((acc, g) => acc + (Number(g.tokenReward) || 0), 0);
 
   // Determine initial category: first incomplete one, or First Steps if all done
   useEffect(() => {
@@ -398,7 +421,7 @@ export default function AchievementsPage() {
   const [friendsLoading, setFriendsLoading] = useState(false);
   const [addFriendOpen, setAddFriendOpen] = useState(false);
   const [friendSearch, setFriendSearch] = useState("");
-  const [friendSearchResult, setFriendSearchResult] = useState<UserProfile | null | "notfound">(null);
+  const [friendSearchResult, setFriendSearchResult] = useState<UserProfile[] | null | "notfound">(null);
   const [friendSearching, setFriendSearching] = useState(false);
   const [sendingRequest, setSendingRequest] = useState(false);
 
@@ -406,11 +429,36 @@ export default function AchievementsPage() {
     getAllGraves()
       .then((g) => {
         setGraves(g);
-        setUnlocks(loadUnlocks());
+        const u = loadUnlocks();
+        // Snapshot what's unseen BEFORE clearing so we can pin a "Just unlocked"
+        // section, then mark everything seen (clears the Explorer nav badge).
+        const unseen = unseenUnlocks(u);
+        if (unseen.length > 0) {
+          const ids = new Set(unseen.map((r) => r.id));
+          setJustUnlocked(ACHIEVEMENTS.filter((a) => ids.has(a.id)));
+          markUnlocksSeen();
+          setNeedsSeenPush(true); // persist the cleared state to the cloud
+        }
+        setUnlocks(u);
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
   }, []);
+
+  // Persist the "seen" clear to the cloud once auth resolves, so the badge stays
+  // cleared on other devices too. Fire-and-forget; local is the source of truth.
+  useEffect(() => {
+    if (!user || !needsSeenPush) return;
+    const supabase = createClient();
+    pushExplorerPoints(supabase, user.id).catch(() => {});
+    setNeedsSeenPush(false);
+  }, [user, needsSeenPush]);
+
+  // Keep the shared goals fresh when this page opens (the provider coalesces the
+  // /api/goals call across consumers, so this doesn't add a round-trip).
+  useEffect(() => {
+    if (user) void eco?.refreshRewards?.();
+  }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load confirmed friends
   useEffect(() => {
@@ -420,7 +468,7 @@ export default function AchievementsPage() {
     (async () => {
       try {
         const { data: relData } = await supabase
-          .from("user_relationships")
+          .from("gravelens_user_relationships")
           .select("from_user_id, to_user_id")
           .eq("type", "friend")
           .or(`from_user_id.eq.${user.id},to_user_id.eq.${user.id}`);
@@ -429,28 +477,26 @@ export default function AchievementsPage() {
           r.from_user_id === user.id ? r.to_user_id : r.from_user_id
         );
         const { data: profiles } = await supabase
-          .from("user_profiles")
-          .select("user_id, username, display_name, show_username, explorer_xp, explorer_rank, public_grave_count")
+          .from("gravelens_user_profiles")
+          .select("user_id, display_name, show_username, explorer_xp, explorer_rank, public_scan_count")
           .in("user_id", friendIds);
         setFriends(
           (profiles ?? []).map((p: {
             user_id: string;
-            username: string | null;
             display_name: string | null;
             show_username: boolean | null;
             explorer_xp: number | null;
             explorer_rank: number | null;
-            public_grave_count: number | null;
+            public_scan_count: number | null;
           }) => ({
             userId: p.user_id,
-            username: p.username ?? undefined,
             displayName: p.display_name ?? undefined,
             showUsername: p.show_username ?? true,
             shareAllByDefault: false,
             explorerXp: p.explorer_xp ?? 0,
             explorerRank: p.explorer_rank ?? 1,
             graveCount: 0,
-            publicGraveCount: p.public_grave_count ?? 0,
+            publicGraveCount: p.public_scan_count ?? 0,
             joinedAt: "",
           }))
         );
@@ -466,25 +512,37 @@ export default function AchievementsPage() {
     try {
       const supabase = createClient();
       const query = friendSearch.trim().replace(/^@/, "");
+      // Search by Display Name; only users who chose to show their name are
+      // discoverable. Same-named people are disambiguated by rank + graves shared.
       const { data } = await supabase
-        .from("user_profiles")
-        .select("user_id, username, display_name, show_username, explorer_xp, explorer_rank, public_grave_count")
-        .or(`username.eq.${query},display_name.ilike.%${query}%`)
-        .limit(1)
-        .maybeSingle();
-      if (!data) { setFriendSearchResult("notfound"); return; }
-      setFriendSearchResult({
-        userId: data.user_id,
-        username: data.username ?? undefined,
-        displayName: data.display_name ?? undefined,
-        showUsername: data.show_username ?? true,
-        shareAllByDefault: false,
-        explorerXp: data.explorer_xp ?? 0,
-        explorerRank: data.explorer_rank ?? 1,
-        graveCount: 0,
-        publicGraveCount: data.public_grave_count ?? 0,
-        joinedAt: "",
-      });
+        .from("gravelens_user_profiles")
+        .select("user_id, display_name, show_username, explorer_xp, explorer_rank, public_scan_count")
+        .eq("show_username", true)
+        .ilike("display_name", `%${query}%`)
+        .limit(10);
+      type SearchRow = {
+        user_id: string;
+        display_name: string | null;
+        show_username: boolean | null;
+        explorer_xp: number | null;
+        explorer_rank: number | null;
+        public_scan_count: number | null;
+      };
+      const rows = ((data ?? []) as SearchRow[]).filter((d) => d.user_id !== user?.id);
+      if (rows.length === 0) { setFriendSearchResult("notfound"); return; }
+      setFriendSearchResult(
+        rows.map((d) => ({
+          userId: d.user_id,
+          displayName: d.display_name ?? undefined,
+          showUsername: d.show_username ?? true,
+          shareAllByDefault: false,
+          explorerXp: d.explorer_xp ?? 0,
+          explorerRank: d.explorer_rank ?? 1,
+          graveCount: 0,
+          publicGraveCount: d.public_scan_count ?? 0,
+          joinedAt: "",
+        }))
+      );
     } catch { setFriendSearchResult("notfound"); }
     finally { setFriendSearching(false); }
   };
@@ -494,7 +552,7 @@ export default function AchievementsPage() {
     setSendingRequest(true);
     try {
       const supabase = createClient();
-      await supabase.from("user_relationships").insert({
+      await supabase.from("gravelens_user_relationships").insert({
         from_user_id: user.id,
         to_user_id: toUserId,
         type: "friend_request",
@@ -527,7 +585,10 @@ export default function AchievementsPage() {
           <path d="M18 2H6v7a6 6 0 0 0 12 0V2z" />
         </svg>
       }
-      customMainClasses="items-center w-full px-4 pb-44 space-y-6 mt-5 max-w-lg mx-auto scroll-container"
+      backgroundClass="bg-transparent"
+      // Full-width main = the whole area scrolls (even over the side gutters);
+      // children are centered/capped via the direct-child utilities.
+      customMainClasses="w-full px-4 pb-44 mt-5 scroll-container flex flex-col items-center"
       absoluteOverlays={
         selectedId && (() => {
           const achievement = ACHIEVEMENTS.find((a) => a.id === selectedId);
@@ -549,6 +610,46 @@ export default function AchievementsPage() {
         })()
       }
     >
+      <div className="w-full max-w-lg mx-auto rounded-3xl bg-stone-950/70 border border-white/5 p-3 sm:p-4 space-y-6">
+        {/* Signed-out prompt — community/explorer features need a LowHigh login */}
+        {signedOut && SHOW_COMMUNITY_FEATURES && (
+          <Link
+            href="/login?next=/explorer"
+            // shrink-0: this is a direct child of PageShell's scrolling flex
+            // column. Without it, flexbox compresses the fixed h-10 down to the
+            // text's line height when the page overflows, making the button thin.
+            className="flex shrink-0 items-center justify-center gap-2 w-full h-10 rounded-xl text-sm font-semibold transition-opacity hover:opacity-90"
+            // Same two gold stops as the sidebar Sign In button, but a vertical
+            // (180deg) gradient so it renders identically at any width. The
+            // sidebar's 135deg spread washes out when stretched full-width
+            // because the dark stop gets pushed into the bottom-right corner.
+            style={{ background: "linear-gradient(180deg, #c9a84c 0%, #a07830 100%)", color: "#1a1917" }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+              <polyline points="10 17 15 12 10 7"/>
+              <line x1="15" y1="12" x2="3" y2="12"/>
+            </svg>
+            Sign In to Explore
+          </Link>
+        )}
+
+        {/* Rank-reward nudge — only when there are unclaimed bonus tokens */}
+        {rankClaimable > 0 && (
+          <Link
+            href="/rewards"
+            className="flex shrink-0 items-center gap-3 w-full rounded-2xl px-4 py-3 transition-all active:scale-[0.98]"
+            style={{ background: "linear-gradient(135deg, var(--t-gold-500), var(--t-gold-400))", color: "#1a1917" }}
+          >
+            <Gift size={20} strokeWidth={2.25} />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-bold leading-tight">You&apos;ve earned a rank reward</p>
+              <p className="text-xs opacity-80">Claim {formatTokens(rankClaimable)} bonus tokens</p>
+            </div>
+            <span className="text-xs font-bold underline underline-offset-2">Claim</span>
+          </Link>
+        )}
+
         {/* Rank card */}
         <div
           className="rounded-2xl p-5"
@@ -609,7 +710,7 @@ export default function AchievementsPage() {
                         : isPastRank
                         ? "rgba(201,168,76,0.4)"
                         : "rgba(255,255,255,0.1)",
-                      color: isCurrentRank ? "#1a1510" : isPastRank ? "var(--t-gold-500)" : "#4a4540",
+                      color: isCurrentRank ? "#1a1510" : isPastRank ? "var(--t-gold-500)" : "#8a8580",
                     }}
                   >
                     {r.level}
@@ -638,7 +739,7 @@ export default function AchievementsPage() {
                 key={s.label}
                 className="rounded-xl p-3 text-center"
                 style={{
-                  background: "rgba(var(--glass-bg-rgb), 0.8)",
+                  background: "rgba(var(--glass-bg-rgb), 0.85)",
                   border: "1px solid var(--t-stone-700)",
                 }}
               >
@@ -657,7 +758,7 @@ export default function AchievementsPage() {
         {user && SHOW_COMMUNITY_FEATURES && (
           <section>
             <div className="flex items-center gap-2 mb-3">
-              <span className="text-lg">👥</span>
+              <Users size={18} strokeWidth={1.75} style={{ color: "var(--t-gold-500)" }} />
               <h3 className="font-serif text-base font-semibold text-stone-200">Explorer Friends</h3>
               <button
                 onClick={() => { setAddFriendOpen((o) => !o); setFriendSearch(""); setFriendSearchResult(null); }}
@@ -672,17 +773,17 @@ export default function AchievementsPage() {
             {addFriendOpen && (
               <div
                 className="rounded-2xl p-4 mb-3 flex flex-col gap-3"
-                style={{ background: "rgba(var(--glass-bg-rgb), 0.8)", border: "1px solid var(--t-stone-700)" }}
+                style={{ background: "rgba(var(--glass-bg-rgb), 0.85)", border: "1px solid var(--t-stone-700)" }}
               >
-                <p className="text-stone-400 text-xs">Search by @username</p>
+                <p className="text-stone-400 text-xs">Search by name</p>
                 <div className="flex gap-2">
                   <input
                     type="text"
                     value={friendSearch}
                     onChange={(e) => setFriendSearch(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && handleSearchFriend()}
-                    placeholder="@username"
-                    className="flex-1 bg-stone-800 text-stone-200 text-sm rounded-lg px-3 py-2 border border-stone-700 focus:outline-none focus:border-stone-500 placeholder:text-stone-600"
+                    placeholder="Explorer's name…"
+                    className="flex-1 bg-stone-800 text-stone-200 text-base rounded-lg px-3 py-2 border border-stone-700 focus:outline-none focus:border-stone-500 placeholder:text-stone-400"
                   />
                   <button
                     onClick={handleSearchFriend}
@@ -695,24 +796,33 @@ export default function AchievementsPage() {
                 </div>
 
                 {friendSearchResult === "notfound" && (
-                  <p className="text-stone-500 text-xs">No explorer found with that username.</p>
+                  <p className="text-stone-500 text-xs">No explorer found with that name. They may keep their name private.</p>
                 )}
-                {friendSearchResult && friendSearchResult !== "notfound" && (
-                  <div className="flex items-center gap-3 rounded-xl p-3" style={{ background: "rgba(var(--glass-bg-rgb), 0.03)", border: "1px solid var(--t-stone-700)" }}>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-stone-200 text-sm font-semibold">
-                        {friendSearchResult.showUsername && friendSearchResult.username ? `@${friendSearchResult.username}` : friendSearchResult.displayName || "Explorer"}
-                      </p>
-                      <p className="text-stone-500 text-[0.75rem]">{getRank(friendSearchResult.explorerXp).title}</p>
-                    </div>
-                    <button
-                      onClick={() => handleSendRequest(friendSearchResult.userId)}
-                      disabled={sendingRequest}
-                      className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-95 disabled:opacity-50"
-                      style={{ background: "var(--t-gold-500)", color: "#1a1510" }}
-                    >
-                      {sendingRequest ? "…" : "Send Request"}
-                    </button>
+                {Array.isArray(friendSearchResult) && (
+                  <div className="flex flex-col gap-2">
+                    {friendSearchResult.length > 1 && (
+                      <p className="text-stone-500 text-[0.7rem]">Multiple matches — check the rank to pick the right explorer.</p>
+                    )}
+                    {friendSearchResult.map((r) => {
+                      const rRank = getRank(r.explorerXp);
+                      return (
+                        <div key={r.userId} className="flex items-center gap-3 rounded-xl p-3" style={{ background: "rgba(var(--glass-bg-rgb), 0.85)", border: "1px solid var(--t-stone-700)" }}>
+                          <RankInsignia level={rRank.level} size={28} />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-stone-200 text-sm font-semibold truncate">{r.displayName || "Community Member"}</p>
+                            <p className="text-stone-500 text-[0.75rem]">{rRank.title} · {r.publicGraveCount} graves shared</p>
+                          </div>
+                          <button
+                            onClick={() => handleSendRequest(r.userId)}
+                            disabled={sendingRequest}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-95 disabled:opacity-50"
+                            style={{ background: "var(--t-gold-500)", color: "#1a1510" }}
+                          >
+                            {sendingRequest ? "…" : "Send Request"}
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -723,7 +833,7 @@ export default function AchievementsPage() {
                 <div className="w-5 h-5 border-2 border-stone-600 border-t-stone-400 rounded-full animate-spin" />
               </div>
             ) : friends.length === 0 ? (
-              <p className="text-stone-600 text-sm text-center py-4 italic">
+              <p className="text-stone-400 text-sm text-center py-4 italic">
                 No friends yet — search above to connect with other explorers.
               </p>
             ) : (
@@ -731,6 +841,32 @@ export default function AchievementsPage() {
                 {friends.map((f) => <FriendCard key={f.userId} profile={f} />)}
               </div>
             )}
+          </section>
+        )}
+
+        {/* Just unlocked — the achievements the user hasn't viewed yet, pinned
+            above the grid. Populated from the unseen set captured on load. */}
+        {justUnlocked.length > 0 && (
+          <section className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="flex items-center gap-2 mb-3">
+              <Sparkles size={18} strokeWidth={1.75} style={{ color: "var(--t-gold-500)" }} />
+              <h3 className="font-serif text-base font-semibold text-stone-200">
+                Just unlocked
+              </h3>
+              <span className="text-xs text-stone-500">{justUnlocked.length} new</span>
+            </div>
+            <div className="space-y-3">
+              {justUnlocked.map((achievement) => (
+                <AchievementCard
+                  key={achievement.id}
+                  achievement={achievement}
+                  unlocked
+                  progress={1}
+                  label=""
+                  onClick={() => setSelectedId(achievement.id)}
+                />
+              ))}
+            </div>
           </section>
         )}
 
@@ -752,14 +888,14 @@ export default function AchievementsPage() {
                 const isComplete = catUnlocked === items.length;
                 return (
                   <option key={category} value={category} className="bg-stone-900 py-2">
-                    {CATEGORY_ICONS[category]} {category} {isComplete ? "✓" : `(${catUnlocked}/${items.length})`}
+                    {category} {isComplete ? "✓" : `(${catUnlocked}/${items.length})`}
                   </option>
                 );
               })}
             </select>
             {/* Custom dropdown arrow */}
             <div className="absolute right-5 top-1/2 -translate-y-1/2 pointer-events-none">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6a6560" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8a8580" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                 <polyline points="6 9 12 15 18 9" />
               </svg>
             </div>
@@ -788,6 +924,17 @@ export default function AchievementsPage() {
             </div>
           )}
         </div>
+
+        {/* Bottom CTA into Balance & Rewards (ranks → token bonuses).
+            Matches the page's sign-in button: same gold gradient, h-10, rounded-xl. */}
+        <Link
+          href="/rewards"
+          className="flex shrink-0 items-center justify-center gap-2 w-full h-10 rounded-xl text-sm font-semibold transition-opacity hover:opacity-90"
+          style={{ background: "linear-gradient(180deg, #c9a84c 0%, #a07830 100%)", color: "#1a1917" }}
+        >
+          <Gift size={16} strokeWidth={2} /> View Balance &amp; Rewards
+        </Link>
+      </div>
     </PageShell>
   );
 }

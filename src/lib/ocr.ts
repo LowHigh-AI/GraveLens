@@ -6,17 +6,24 @@ export interface OcrResult {
 }
 
 export async function runTesseract(imageFile: File | Blob): Promise<OcrResult> {
-  // Dynamically import to avoid SSR issues
-  const Tesseract = (await import("tesseract.js")).default;
+  // The dynamic import + WASM worker can fail to load (offline, blocked CDN,
+  // low memory). Degrade to an empty result rather than throwing so every
+  // caller gets a stable shape and the capture flow never crashes.
+  try {
+    const Tesseract = (await import("tesseract.js")).default;
 
-  const result = await Tesseract.recognize(imageFile, "eng", {
-    logger: () => {}, // suppress console noise
-  });
+    const result = await Tesseract.recognize(imageFile, "eng", {
+      logger: () => {}, // suppress console noise
+    });
 
-  return {
-    text: result.data.text.trim(),
-    confidence: result.data.confidence,
-  };
+    return {
+      text: result.data.text.trim(),
+      confidence: result.data.confidence,
+    };
+  } catch (err) {
+    console.warn("[ocr] Tesseract failed to run:", err);
+    return { text: "", confidence: 0 };
+  }
 }
 
 // Parse raw OCR text into structured fields as a best-effort fallback

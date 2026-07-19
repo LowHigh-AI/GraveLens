@@ -4,9 +4,10 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import BrandLogo from "@/components/ui/BrandLogo";
-import ProfileBadge from "@/components/auth/ProfileBadge";
 import { getQueueCount } from "@/lib/storage";
 import { QUEUE_CHANGED_EVENT } from "@/lib/queue";
+import { useAuth } from "@/lib/auth";
+import { unseenCount, ACHIEVEMENT_UNSEEN_EVENT } from "@/lib/achievements";
 
 const navItems = [
   {
@@ -56,9 +57,8 @@ const navItems = [
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
         stroke={active ? "var(--t-gold-500)" : "var(--t-stone-400)"}
         strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="8" r="4" />
-        <path d="M8 8H4l2 8h12l2-8h-4" />
-        <path d="M9 16l1 4h4l1-4" />
+        <circle cx="12" cy="12" r="10" />
+        <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
       </svg>
     ),
   },
@@ -66,24 +66,39 @@ const navItems = [
 
 export default function DesktopNav() {
   const pathname = usePathname();
+  const { user, loading: authLoading } = useAuth();
   const [queueCount, setQueueCount] = useState(0);
+  const [unseen, setUnseen] = useState(0);
+
+  // Gate on the resolved auth state (tri-state) so we never flash "Sign In" at an
+  // already-signed-in user during the brief auth-loading window.
+  const signedOut = !authLoading && !user;
 
   useEffect(() => {
     getQueueCount().then(setQueueCount).catch(() => {});
     const onQueueChanged = () => getQueueCount().then(setQueueCount).catch(() => {});
     window.addEventListener(QUEUE_CHANGED_EVENT, onQueueChanged);
-    return () => window.removeEventListener(QUEUE_CHANGED_EVENT, onQueueChanged);
+
+    // Explorer "unseen unlocks" badge — recompute on unlock/view/cloud-merge.
+    const refreshUnseen = () => setUnseen(unseenCount());
+    refreshUnseen();
+    window.addEventListener(ACHIEVEMENT_UNSEEN_EVENT, refreshUnseen);
+
+    return () => {
+      window.removeEventListener(QUEUE_CHANGED_EVENT, onQueueChanged);
+      window.removeEventListener(ACHIEVEMENT_UNSEEN_EVENT, refreshUnseen);
+    };
   }, []);
 
   const isScanActive = pathname === "/" || pathname.startsWith("/result");
 
   return (
     <aside
-      className="fixed left-0 top-0 bottom-0 w-56 z-40 flex flex-col bg-stone-950/80 backdrop-blur-2xl border-r border-stone-800/50"
+      className="fixed left-0 top-0 bottom-0 w-56 z-40 flex flex-col bg-stone-950/80 backdrop-blur-2xl"
       style={{ paddingTop: "max(1.25rem, env(safe-area-inset-top))", paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
     >
       {/* Brand */}
-      <div className="px-5 pb-5 border-b border-stone-800/50">
+      <div className="px-5 pb-5">
         <div className="flex items-center gap-2">
           <BrandLogo size={20} color="var(--t-gold-500)" />
           <span className="font-serif font-semibold text-[1.25rem] leading-none">
@@ -100,7 +115,9 @@ export default function DesktopNav() {
       <nav className="flex flex-col gap-0.5 px-3 pt-4 flex-1">
         {navItems.map((item) => {
           const active = item.matchFn(pathname);
-          const showBadge = item.href === "/" && queueCount > 0;
+          const badgeCount =
+            item.href === "/" ? queueCount : item.href === "/explorer" ? unseen : 0;
+          const showBadge = badgeCount > 0;
           return (
             <Link
               key={item.href}
@@ -121,7 +138,7 @@ export default function DesktopNav() {
                   className="ml-auto min-w-[18px] h-[18px] rounded-full text-[0.7rem] font-bold flex items-center justify-center px-1"
                   style={{ background: "var(--t-gold-500)", color: "#1a1917" }}
                 >
-                  {queueCount > 9 ? "9+" : queueCount}
+                  {badgeCount > 9 ? "9+" : badgeCount}
                 </span>
               )}
             </Link>
@@ -129,10 +146,11 @@ export default function DesktopNav() {
         })}
       </nav>
 
-      {/* Upload button */}
+      {/* Upload / Sign In button — scanning needs a LowHigh login, so signed-out
+          users are routed to sign in rather than into the (gated) upload flow. */}
       <div className="px-3 pb-4">
         <Link
-          href="/"
+          href={signedOut ? "/login?next=/" : "/"}
           className="flex items-center justify-center gap-2 w-full h-10 rounded-xl text-sm font-semibold transition-opacity hover:opacity-90"
           style={{
             background: isScanActive
@@ -141,18 +159,21 @@ export default function DesktopNav() {
             color: "#1a1917",
           }}
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
-          </svg>
-          Upload a Photo
+          {signedOut ? (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+              <polyline points="10 17 15 12 10 7"/>
+              <line x1="15" y1="12" x2="3" y2="12"/>
+            </svg>
+          ) : (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          )}
+          {signedOut ? "Sign In" : "Upload a Photo"}
         </Link>
-      </div>
-
-      {/* Profile */}
-      <div className="px-4 pt-3 border-t border-stone-800/50">
-        <ProfileBadge />
       </div>
     </aside>
   );

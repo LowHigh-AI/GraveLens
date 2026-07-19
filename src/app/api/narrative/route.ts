@@ -1,6 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { requireAuth } from "@/lib/apiAuth";
+import { admitAiCall } from "@/lib/tokenGate";
+import { requireRateLimit } from "@/lib/rateLimit";
+import { logUsage } from "@/lib/lowhigh";
+import { createClient } from "@/lib/supabase/server";
+import { getAiContentCache, saveAiContentCache, aiContentCacheKey } from "@/lib/researchCache";
 
 // Uses Haiku — this is a creative writing task, not vision analysis.
 // Haiku produces excellent narrative prose at ~$0.003/call.
@@ -109,19 +114,47 @@ export async function POST(req: NextRequest) {
   const auth = await requireAuth();
   if (auth instanceof NextResponse) return auth;
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return NextResponse.json(
-      { error: "Configuration error" },
-      { status: 500 }
-    );
-  }
-
   try {
     const body = await req.json().catch(() => null);
     if (!body || typeof body.name !== "string") {
       return NextResponse.json({ error: "Invalid or missing 'name' input" }, { status: 400 });
     }
+
+    // Cap free-text fields that feed into the prompt to bound token spend
+    // (mirrors the inscription cap in /api/story).
+    if (typeof body.name === "string") body.name = body.name.slice(0, 200);
+    if (typeof body.inscription === "string") body.inscription = body.inscription.slice(0, 2000);
+    if (typeof body.epitaph === "string") body.epitaph = body.epitaph.slice(0, 1000);
+    if (typeof body.city === "string") body.city = body.city.slice(0, 120);
+    if (typeof body.state === "string") body.state = body.state.slice(0, 120);
+    if (Array.isArray(body.symbols)) body.symbols = body.symbols.slice(0, 20);
+
+    // ── Shared cache: identical inputs reuse a prior Claude result (no spend) ──
+    // promptId is volatile (per-request id) and must not affect the cache key.
+    const supabase = await createClient();
+    const { promptId: _promptId, ...keyInput } = body;
+    const cacheKey = aiContentCacheKey(keyInput);
+    const cached = await getAiContentCache(supabase, "narrative", cacheKey).catch(() => null);
+    if (cached) {
+      return NextResponse.json({ ...cached, fromCache: true });
+    }
+
+    // Cache miss — gate tokens/rate, then generate.
+    const admit = await admitAiCall(auth.userId, "narrative");
+    if (admit.response) return admit.response;
+    if (admit.release) after(admit.release);
+
+    const rl = await requireRateLimit(auth.userId, "narrative");
+    if (rl) return rl;
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "Configuration error", details: "API key missing." },
+        { status: 500 }
+      );
+    }
+
     const client = new Anthropic({ apiKey });
 
     const message = await client.messages.create({
@@ -150,26 +183,30 @@ export async function POST(req: NextRequest) {
     try {
       result = JSON.parse(rawJson);
     } catch (parseErr) {
-      const start = rawJson.indexOf("{");
-      const end = rawJson.lastIndexOf("}");
-      if (start !== -1 && end > start) {
-        try {
-          result = JSON.parse(rawJson.slice(start, end + 1));
-        } catch {
-          console.error("[narrative] JSON salvage failed on text:", content.text, parseErr);
-          return NextResponse.json(
-            { error: "Claude returned malformed JSON" },
-            { status: 502 }
-          );
-        }
-      } else {
-        console.error("[narrative] JSON parse failed on text:", content.text, parseErr);
-        return NextResponse.json(
-          { error: "Claude returned malformed JSON" },
-          { status: 502 }
-        );
-      }
+      console.error("[narrative] JSON parse failed on text:", content.text, parseErr);
+      return NextResponse.json(
+        { error: "Claude returned malformed JSON", details: rawJson },
+        { status: 502 }
+      );
     }
+
+    // Persist the generated content for reuse by any future identical request.
+    after(() => saveAiContentCache(supabase, "narrative", cacheKey, result).catch(() => {}));
+
+    after(() =>
+      logUsage(auth.userId, {
+        endpoint: "/api/narrative",
+        provider: "anthropic",
+        modelId: `anthropic/${MODEL}`,
+        model: MODEL,
+        requestType: "narrative",
+        inputTokens: message.usage?.input_tokens ?? null,
+        outputTokens: message.usage?.output_tokens ?? null,
+        promptId: typeof body.promptId === "string" && body.promptId ? body.promptId : crypto.randomUUID(),
+        tool: "Narrative",
+        component: "Generate Narrative",
+      })
+    );
 
     return NextResponse.json(result);
   } catch (error: unknown) {

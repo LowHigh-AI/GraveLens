@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import BottomNav from "@/components/layout/BottomNav";
@@ -9,18 +10,24 @@ import { inferGender, inferOrigin, selectVoice, formatTime } from "@/lib/ttsUtil
 import { cemeteryId } from "@/lib/apis/cemetery";
 import { reverseGeocode } from "@/lib/apis/nominatim";
 import { getDeviceLocation } from "@/lib/geo";
-import { checkAndUnlock, loadStats, type Achievement } from "@/lib/achievements";
+import { checkAndUnlock, loadStats } from "@/lib/achievements";
+import AchievementUnlockToast, { type AchievementToastState } from "@/components/achievements/AchievementUnlockToast";
 import { createClient } from "@/lib/supabase/browser";
-import { uploadPhoto, upsertGrave, pushExplorerPoints } from "@/lib/cloudSync";
+import { uploadPhoto, upsertGrave, pushExplorerPoints, notifyExplorerProgress } from "@/lib/cloudSync";
+import { photoProxyUrl } from "@/lib/photoUrl";
 import { fetchBurialIndexRelatives, computePersonIdentityKey, type BurialIndexRelative } from "@/lib/community";
 import { shareGrave, buildEmailShareUrl, buildSmsShareUrl } from "@/lib/share";
 import { interpretSymbols } from "@/lib/apis/symbols";
 import { getLandmarkEvents } from "@/lib/apis/wikipedia";
-import PhotoEditorModal from "@/components/results/PhotoEditorModal";
+import { SCAN_USAGE, HEAR_STORY_USAGE } from "@/lib/usageActions";
+// Opened on demand — load its canvas/crop code only when the editor is invoked.
+const PhotoEditorModal = dynamic(() => import("@/components/results/PhotoEditorModal"), {
+  ssr: false,
+});
 import { SectionHeader, ResearchSummaryCard, CONFIDENCE_INFO } from "@/components/research/cards";
-
 import ProfileBadge from "@/components/auth/ProfileBadge";
 import DesktopNav from "@/components/layout/DesktopNav";
+import { EcosystemLauncher } from "@/components/ecosystem/lowhighShell";
 import { useIsDesktop } from "@/hooks/useIsDesktop";
 import { toNameCase } from "@/lib/nameUtils";
 import { detectConflicts } from "@/lib/conflictDetector";
@@ -46,6 +53,9 @@ interface PendingResult {
   timestamp: number;
   needsReview?: boolean;
   reviewedAt?: number;
+  /** Shared usage id for the scan that created this record (analyze + the
+   *  auto-loaded cultural summary log under it as one "Scan a marker" action). */
+  scanPromptId?: string;
 }
 
 function getPersonalizationDetails(
@@ -90,7 +100,7 @@ export default function ResultPage({ id }: { id: string }) {
   const [authRequired, setAuthRequired] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
   const [shareOpen, setShareOpen] = useState(false);
-  const [achievementToasts, setAchievementToasts] = useState<Achievement[]>([]);
+  const [unlockToast, setUnlockToast] = useState<AchievementToastState | null>(null);
   const [culturalContext, setCulturalContext] = useState<CulturalContext | null>(null);
   const [culturalLoading, setCulturalLoading] = useState(false);
   const [expandingCategory, setExpandingCategory] = useState<string | null>(null);
@@ -224,12 +234,13 @@ export default function ResultPage({ id }: { id: string }) {
           const supabase = createClient();
           const { data: { user } } = await supabase.auth.getUser();
           if (user) {
-            const photoUrl = await uploadPhoto(supabase, user.id, autoRecord.id, autoRecord.photoDataUrl);
+            const photoPath = await uploadPhoto(user.id, autoRecord.id, autoRecord.photoDataUrl);
             // Re-read from DB so this save doesn't clobber research data that
             // the lookup fetch may have written while the upload was in flight.
             const fresh = await getGrave(autoRecord.id);
-            const toSync = { ...(fresh ?? autoRecord), photoDataUrl: photoUrl, syncedAt: Date.now() };
-            await upsertGrave(supabase, user.id, toSync, photoUrl);
+            // Local copy renders via the authenticated proxy; DB stores the path.
+            const toSync = { ...(fresh ?? autoRecord), photoDataUrl: photoProxyUrl(autoRecord.id), syncedAt: Date.now() };
+            await upsertGrave(supabase, user.id, toSync, photoPath);
             await saveGrave(toSync);
           }
         } catch { /* offline or not logged in — local save stands */ }
@@ -238,10 +249,20 @@ export default function ResultPage({ id }: { id: string }) {
         try {
           const allGraves = await getAllGraves();
           const stats = loadStats();
-          const newUnlocks = checkAndUnlock(allGraves, stats);
+          const { newUnlocks, rankUp } = checkAndUnlock(allGraves, stats);
           if (newUnlocks.length > 0) {
-            setAchievementToasts(newUnlocks);
-            setTimeout(() => setAchievementToasts([]), 5000);
+            // Rank-ups earn a dedicated (non-blocking) hero toast; minor unlocks
+            // collapse into a single count pill. When both happen on one save the
+            // hero toast takes precedence — the minor unlocks still light the
+            // Explorer badge silently.
+            setUnlockToast(
+              rankUp
+                ? { kind: "hero", rankLevel: rankUp.level, rankTitle: rankUp.title, bonus: rankUp.bonus }
+                : { kind: "count", count: newUnlocks.length }
+            );
+            // A new unlock may raise the user's rank and unlock a rank reward.
+            // Nudge the ecosystem context to refresh the claimable-rewards dot.
+            notifyExplorerProgress();
           }
           // Push current Explorer state to cloud (new unlocks or not)
           const supabase = createClient();
@@ -276,6 +297,8 @@ export default function ResultPage({ id }: { id: string }) {
         cemetery: data.location?.cemetery,
         inscription: data.extracted.inscription ?? "",
         symbols: data.extracted.symbols ?? [],
+        // Lets the server confidence-gate writes to the shared research index.
+        confidence: data.extracted.confidence,
       };
 
       // Phase 1: person-specific core data — resolves in ~5–7s
@@ -372,10 +395,10 @@ export default function ResultPage({ id }: { id: string }) {
       const supabase = createClient();
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      const photoUrl = await uploadPhoto(supabase, user.id, record.id, record.photoDataUrl);
-      await upsertGrave(supabase, user.id, record, photoUrl);
+      const photoPath = await uploadPhoto(user.id, record.id, record.photoDataUrl);
+      await upsertGrave(supabase, user.id, record, photoPath);
       const fresh = await getGrave(record.id);
-      await saveGrave({ ...(fresh ?? record), photoDataUrl: photoUrl, syncedAt: Date.now() });
+      await saveGrave({ ...(fresh ?? record), photoDataUrl: photoProxyUrl(record.id), syncedAt: Date.now() });
     } catch (err) {
       console.warn("[CloudSync] Non-fatal sync error:", err);
     }
@@ -461,6 +484,10 @@ export default function ResultPage({ id }: { id: string }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode: "summary",
+          // Part of the scan action — log under the same id/identity as the
+          // marker read so the estimator sums them into one "Scan a marker".
+          promptId: pending.scanPromptId,
+          ...SCAN_USAGE,
           name: personExtracted.name,
           birthYear: personExtracted.birthYear,
           deathYear: personExtracted.deathYear,
@@ -583,9 +610,9 @@ export default function ResultPage({ id }: { id: string }) {
         const supabase = createClient();
         const { data: { user } } = await supabase.auth.getUser();
         if (!user) return;
-        const photoUrl = await uploadPhoto(supabase, user.id, pending.id, newDataUrl);
+        await uploadPhoto(user.id, pending.id, newDataUrl);
         const fresh = await getGrave(pending.id);
-        if (fresh) await saveGrave({ ...fresh, photoDataUrl: photoUrl, syncedAt: Date.now() });
+        if (fresh) await saveGrave({ ...fresh, photoDataUrl: photoProxyUrl(pending.id), syncedAt: Date.now() });
       } catch { /* offline or not logged in */ }
     })();
     setPhotoEditing(false);
@@ -1193,7 +1220,11 @@ export default function ResultPage({ id }: { id: string }) {
               <line x1="12" y1="2" x2="12" y2="15"/>
             </svg>
           </button>
-          {!isDesktop && <ProfileBadge />}
+          {/* Global account controls: kept in the header at every width so the
+              launcher + profile badge match every PageShell page (the desktop
+              sidebar carries no account control). */}
+          <EcosystemLauncher />
+          <ProfileBadge />
         </div>
       </header>
 
@@ -1654,41 +1685,9 @@ export default function ResultPage({ id }: { id: string }) {
         />
       )}
 
-      {/* Achievement unlock toasts */}
-      {achievementToasts.length > 0 && (
-        <div className="fixed bottom-0 left-0 right-0 z-50 flex flex-col items-center gap-2 px-4 pb-24 pointer-events-none" style={{ paddingBottom: "calc(5rem + env(safe-area-inset-bottom))" }}>
-          {achievementToasts.map((a) => (
-            <div
-              key={a.id}
-              className="w-full max-w-sm rounded-2xl px-4 py-3 flex items-center gap-3 animate-fade-up"
-              style={{
-                background: "linear-gradient(135deg, var(--t-stone-800), var(--t-stone-900))",
-                border: "1px solid rgba(201,168,76,0.5)",
-                boxShadow: "0 4px 24px rgba(201,168,76,0.2)",
-              }}
-            >
-              <div
-                className="text-2xl w-10 h-10 flex items-center justify-center rounded-lg shrink-0"
-                style={{ background: "rgba(201,168,76,0.15)" }}
-              >
-                {a.icon}
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-[0.75rem] uppercase tracking-widest font-medium" style={{ color: "var(--t-gold-500)" }}>
-                  Achievement Unlocked
-                </p>
-                <p className="text-sm font-semibold text-stone-100 leading-tight mt-0.5">{a.title}</p>
-                <p className="text-[0.8rem] text-stone-400 truncate">{a.flavour}</p>
-              </div>
-              <span
-                className="text-xs font-bold shrink-0 px-2 py-1 rounded-lg"
-                style={{ background: "rgba(201,168,76,0.2)", color: "var(--t-gold-200)" }}
-              >
-                +{a.xp} XP
-              </span>
-            </div>
-          ))}
-        </div>
+      {/* Achievement unlock notification — single count pill or rank-up hero */}
+      {unlockToast && (
+        <AchievementUnlockToast state={unlockToast} onDismiss={() => setUnlockToast(null)} />
       )}
 
       <BottomNav />
@@ -3128,6 +3127,9 @@ function StoryCard({
 
     (async () => {
       try {
+        // One shared id + action label for every AI call in this "Hear their
+        // story" pre-generation, so the estimator sums them into one action.
+        const hearStoryPromptId = crypto.randomUUID();
         let script: string;
         let epitaphSource = "";
         let epitaphMeaning = "";
@@ -3143,6 +3145,8 @@ function StoryCard({
             headers: { "Content-Type": "application/json" },
             signal: abort.signal,
             body: JSON.stringify({
+              promptId: hearStoryPromptId,
+              ...HEAR_STORY_USAGE,
               name: extracted.name,
               birthDate: extracted.birthDate,
               deathDate: extracted.deathDate,
@@ -3183,7 +3187,7 @@ function StoryCard({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: abort.signal,
-          body: JSON.stringify({ text: script, voice }),
+          body: JSON.stringify({ text: script, voice, promptId: hearStoryPromptId, ...HEAR_STORY_USAGE }),
         });
         if (abort.signal.aborted || !ttsRes.ok) return;
 
@@ -3216,6 +3220,9 @@ function StoryCard({
 
     setHasError(false);
     setLoadingPhase("crafting");
+    // One shared id + action label for every AI call in this tap, so the usage
+    // estimator sums cultural + story + narration into one "Hear their story".
+    const hearStoryPromptId = crypto.randomUUID();
     try {
       // ── Optimisation 1: reuse already-loaded cultural context ────────────
       // The page auto-loads cultural context after research arrives.
@@ -3225,6 +3232,8 @@ function StoryCard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode: "summary",
+          promptId: hearStoryPromptId,
+          ...HEAR_STORY_USAGE,
           name: extracted.name,
           birthYear: extracted.birthYear,
           deathYear: extracted.deathYear,
@@ -3259,6 +3268,8 @@ function StoryCard({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            promptId: hearStoryPromptId,
+            ...HEAR_STORY_USAGE,
             name: extracted.name,
             birthDate: extracted.birthDate,
             deathDate: extracted.deathDate,
@@ -3304,7 +3315,7 @@ function StoryCard({
       const ttsRes = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: script, voice }),
+        body: JSON.stringify({ text: script, voice, promptId: hearStoryPromptId, ...HEAR_STORY_USAGE }),
       });
       if (!ttsRes.ok) throw new Error("tts " + ttsRes.status);
 

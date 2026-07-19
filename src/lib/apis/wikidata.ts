@@ -122,7 +122,8 @@ export async function getNotableFiguresInBounds(
   west: number,
   north: number,
   east: number,
-  minSitelinks = 2
+  minSitelinks = 2,
+  signal?: AbortSignal
 ): Promise<NotableFigure[]> {
   const safeSouth = safeNum(south);
   const safeWest  = safeNum(west);
@@ -161,7 +162,7 @@ LIMIT 100`.trim();
           Accept: "application/sparql-results+json",
           "User-Agent": "GraveLens/1.0 (genealogy research app)",
         },
-        signal: AbortSignal.timeout(12000),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(12000), signal]) : AbortSignal.timeout(12000),
       }
     );
 
@@ -201,6 +202,8 @@ LIMIT 100`.trim();
       })
       .filter((n): n is NotableFigure => n !== null);
   } catch (err) {
+    // Propagate caller-initiated cancellation; degrade other failures to empty.
+    if ((err as Error)?.name === "AbortError") throw err;
     console.warn("Wikidata notable figures fetch failed:", err);
     return [];
   }

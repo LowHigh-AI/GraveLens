@@ -70,6 +70,15 @@ html[data-theme="light"] {
   --color-gold-200: var(--t-gold-200);
 }
 
+/* Tailwind v4's Preflight resets buttons to cursor: default. Restore the pointer
+   the rest of the app relies on; cursor-* utilities still override this. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+}
+
 html {
   background-color: var(--bg-fallback);
   height: 100%;

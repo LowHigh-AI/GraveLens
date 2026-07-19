@@ -3,6 +3,10 @@ import { Playfair_Display, Inter } from "next/font/google";
 import "./globals.css";
 import ServiceWorkerRegister from "./sw-register";
 import InstallPrompt from "@/components/InstallPrompt";
+import AutoBackup from "@/components/sync/AutoBackup";
+import { AuthProvider } from "@/lib/auth";
+import { EcosystemProvider } from "@/components/ecosystem/EcosystemProvider";
+import { LowHighSupportHost } from "@/components/ecosystem/lowhighShell";
 
 const playfair = Playfair_Display({
   variable: "--font-playfair",
@@ -17,12 +21,15 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://www.gravelens.com"),
+  // Single manifest source: the static public/manifest.json (also precached by
+  // public/sw.js). src/app/manifest.ts was the conflicting dead duplicate.
   manifest: "/manifest.json",
-  title: "GraveLens — Bring the story behind every stone into focus",
+  title: "GraveLens: Bring the story behind every stone into focus",
   description:
     "Photograph any headstone to travel through history and reveal a lifetime of memories. Discover the unique stories and legacies within every stone.",
   openGraph: {
-    title: "GraveLens — Bring the story behind every stone into focus",
+    title: "GraveLens: Bring the story behind every stone into focus",
     description: "Photograph any headstone to travel through history and reveal a lifetime of memories.",
     url: "https://www.gravelens.com",
     siteName: "GraveLens",
@@ -39,7 +46,7 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: "summary_large_image",
-    title: "GraveLens — Bring the story behind every stone into focus",
+    title: "GraveLens: Bring the story behind every stone into focus",
     description: "Photograph any headstone to travel through history and reveal a lifetime of memories.",
     images: ["/opengraph-image.png"],
   },
@@ -81,8 +88,17 @@ export default function RootLayout({
       </head>
       <body className="flex flex-col h-full text-stone-50 font-sans overflow-hidden">
         <ServiceWorkerRegister />
-        {children}
-        <InstallPrompt />
+        <AuthProvider>
+          <EcosystemProvider>
+            {children}
+            <InstallPrompt />
+            <AutoBackup />
+            {/* Shared LowHigh support sheet: lives at the layout root so its
+                fixed positioning is not trapped by transformed/filtered
+                ancestors. Opened via openLowHighSupport(). */}
+            <LowHighSupportHost />
+          </EcosystemProvider>
+        </AuthProvider>
       </body>
     </html>
   );

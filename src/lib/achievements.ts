@@ -42,6 +42,43 @@ export function xpToNextRank(xp: number): { needed: number; progress: number } {
   return { needed: next.minXP - xp, progress: earned / span };
 }
 
+// ── Rank token rewards ─────────────────────────────────────────────────────
+// Reaching a new Explorer rank grants a one-time LowHigh-token bonus, claimable
+// on the Balance & Rewards page. Rank 1 is the starting rank (no bonus). These
+// amounts are the canonical reference for the per-rank reward. Each level maps to
+// a goal row `gravelens_rank_<level>` in the shared `goals` table whose
+// token_amount MUST match the value here; the shared `claim_goal` RPC does the
+// atomic, idempotent credit. Keep in sync with
+// GraveLens/db/migrations/gravelens_rewards_goals.sql when tuning.
+export const RANK_TOKEN_BONUS: Record<number, number> = {
+  2: 5_000,
+  3: 10_000,
+  4: 15_000,
+  5: 20_000,
+  6: 30_000,
+  7: 40_000,
+  8: 50_000,
+  9: 75_000,
+  10: 100_000,
+};
+
+/** Token reward for reaching exactly this rank level (0 for rank 1 / unknown). */
+export function rankBonus(level: number): number {
+  return RANK_TOKEN_BONUS[level] ?? 0;
+}
+
+/** Cumulative token reward for every rank from 2 through `level` inclusive. */
+export function rankBonusUpTo(level: number): number {
+  let sum = 0;
+  for (let l = 2; l <= level; l++) sum += rankBonus(l);
+  return sum;
+}
+
+/** The slug of the hidden seed goal backing a given rank level's bonus. */
+export function rankGoalSlug(level: number): string {
+  return `gravelens_rank_${level}`;
+}
+
 // ── Achievement definitions ───────────────────────────────────────────────
 
 export type AchievementCategory =
@@ -894,6 +931,63 @@ const UNLOCKS_KEY = "gl_achievement_unlocks";
 export interface UnlockRecord {
   id: string;
   unlockedAt: number;
+  /**
+   * Whether the user has viewed this unlock (i.e. opened the Explorer since it
+   * unlocked). Drives the Explorer nav "unseen" badge. Records written before
+   * this field existed have `seen` undefined and are treated as already seen —
+   * they predate the badge, so surfacing them would be noise. Only `seen ===
+   * false` counts as unseen.
+   */
+  seen?: boolean;
+}
+
+/** True unless the record is explicitly marked unseen (`seen === false`). */
+export function isUnlockSeen(u: UnlockRecord): boolean {
+  return u.seen !== false;
+}
+
+/** Newly-unlocked records the user hasn't viewed yet. */
+export function unseenUnlocks(unlocks: UnlockRecord[]): UnlockRecord[] {
+  return unlocks.filter((u) => u.seen === false);
+}
+
+/** Count of unlocks the user hasn't viewed yet (Explorer badge count). */
+export function unseenCount(unlocks: UnlockRecord[] = loadUnlocks()): number {
+  return unseenUnlocks(unlocks).length;
+}
+
+/**
+ * Fired on `window` whenever the unseen-unlock set changes — a new unlock is
+ * recorded, or the user views the Explorer and unseen items are cleared. The
+ * nav badges listen for this to refresh without a reload.
+ */
+export const ACHIEVEMENT_UNSEEN_EVENT = "gl:achievement-unseen";
+
+function notifyUnseenChanged(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(ACHIEVEMENT_UNSEEN_EVENT));
+  }
+}
+
+/**
+ * Mark every currently-unseen unlock as seen. Returns the ids that changed so
+ * the caller can decide whether to push the new state to the cloud. Fires the
+ * unseen-changed event when anything changed.
+ */
+export function markUnlocksSeen(): string[] {
+  const unlocks = loadUnlocks();
+  const changed: string[] = [];
+  for (const u of unlocks) {
+    if (u.seen === false) {
+      u.seen = true;
+      changed.push(u.id);
+    }
+  }
+  if (changed.length > 0) {
+    saveUnlocks(unlocks);
+    notifyUnseenChanged();
+  }
+  return changed;
 }
 
 export function loadUnlocks(): UnlockRecord[] {
@@ -914,16 +1008,33 @@ export function isUnlocked(id: string, unlocks: UnlockRecord[]): boolean {
   return unlocks.some((u) => u.id === id);
 }
 
+/** Signals a rank increase caused by a save, for the celebratory hero toast. */
+export interface RankUp {
+  level: number;
+  title: string;
+  /** One-time claimable token bonus for reaching this rank (0 if none). */
+  bonus: number;
+}
+
+export interface UnlockResult {
+  /** Minor achievements newly unlocked in this call. */
+  newUnlocks: Achievement[];
+  /** Set when the new unlocks pushed the user across a rank threshold. */
+  rankUp: RankUp | null;
+}
+
 /**
- * Evaluate all achievements against the current graves + stats.
- * Returns any achievements newly unlocked in this call (for toast notifications).
+ * Evaluate all achievements against the current graves + stats. Records any
+ * newly-unlocked achievements (as unseen), and reports whether the added XP
+ * raised the user's rank so the caller can show the right notification.
  */
 export function checkAndUnlock(
   graves: GraveRecord[],
   stats: AppStats
-): Achievement[] {
+): UnlockResult {
   const existing = loadUnlocks();
   const alreadyUnlocked = new Set(existing.map((u) => u.id));
+  const rankBefore = getRank(totalXP(existing)).level;
   const newUnlocks: Achievement[] = [];
   const now = Date.now();
 
@@ -931,13 +1042,28 @@ export function checkAndUnlock(
     if (alreadyUnlocked.has(a.id)) continue;
     const { ratio } = a.evaluate(graves, stats);
     if (ratio >= 1) {
-      existing.push({ id: a.id, unlockedAt: now });
+      existing.push({ id: a.id, unlockedAt: now, seen: false });
       newUnlocks.push(a);
     }
   }
 
-  if (newUnlocks.length > 0) saveUnlocks(existing);
-  return newUnlocks;
+  if (newUnlocks.length === 0) return { newUnlocks, rankUp: null };
+
+  saveUnlocks(existing);
+  notifyUnseenChanged();
+
+  const rankAfter = getRank(totalXP(existing));
+  const rankUp: RankUp | null =
+    rankAfter.level > rankBefore
+      ? {
+          level: rankAfter.level,
+          title: rankAfter.title,
+          // Cumulative bonus for every rank crossed in this save (usually one).
+          bonus: rankBonusUpTo(rankAfter.level) - rankBonusUpTo(rankBefore),
+        }
+      : null;
+
+  return { newUnlocks, rankUp };
 }
 
 export function totalXP(unlocks: UnlockRecord[]): number {

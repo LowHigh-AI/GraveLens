@@ -3,15 +3,27 @@ import { requireAuth } from "@/lib/apiAuth";
 import { enrichCemetery, fetchOsmCemeteryDetails, cemeteryId } from "@/lib/apis/cemetery";
 import { createClient } from "@/lib/supabase/server";
 import { checkCemeteryCache, saveCemeteryCache } from "@/lib/community";
+import { requireRateLimit } from "@/lib/rateLimit";
 
 export async function POST(req: NextRequest) {
   const auth = await requireAuth();
   if (auth instanceof NextResponse) return auth;
 
+  // Calls Overpass + Wikipedia; rate-limit so it can't be looped against them.
+  const rl = await requireRateLimit(auth.userId, "enrich");
+  if (rl) return rl;
+
   try {
     const { name, lat, lng, city, state, force } = await req.json();
     if (!name || typeof lat !== "number" || typeof lng !== "number") {
       return NextResponse.json({ error: "name, lat, lng required" }, { status: 400 });
+    }
+
+    // The force-refresh path bypasses the cache and always hits the upstream
+    // APIs — gate it behind a much tighter sub-limit.
+    if (force) {
+      const forceRl = await requireRateLimit(auth.userId, "enrich-force");
+      if (forceRl) return forceRl;
     }
 
     const supabase = await createClient();

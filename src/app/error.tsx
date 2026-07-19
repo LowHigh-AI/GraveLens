@@ -66,8 +66,9 @@ export default function RootError({ error, reset }: ErrorProps) {
           An unexpected error occurred while processing this page. The scan queue and your saved data remain secure.
         </p>
 
-        {/* Error Details Card (Glassmorphism) */}
-        {error.message && (
+        {/* Error Details Card (Glassmorphism). The raw message can leak internal
+            strings, so it is dev-only; the digest is safe and stays for support. */}
+        {((process.env.NODE_ENV !== "production" && error.message) || error.digest) && (
           <div
             className="w-full text-left rounded-xl p-4 mb-8 font-mono text-xs text-red-300 leading-relaxed overflow-x-auto max-h-36"
             style={{
@@ -77,7 +78,9 @@ export default function RootError({ error, reset }: ErrorProps) {
             }}
           >
             <p className="font-semibold text-red-400 mb-1">Details:</p>
-            <p className="whitespace-pre-wrap">{error.message}</p>
+            {process.env.NODE_ENV !== "production" && error.message && (
+              <p className="whitespace-pre-wrap">{error.message}</p>
+            )}
             {error.digest && (
               <p className="text-stone-500 mt-2 text-[0.65rem]">Digest: {error.digest}</p>
             )}

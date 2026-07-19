@@ -42,7 +42,7 @@ const SLIDES = [
       </svg>
     ),
     headline: "Your archive, forever.",
-    body: "Every scan is saved to your personal archive — browseable on a map, accessible offline, and yours to keep.",
+    body: "Every scan is saved to your personal archive — browseable on a map, accessible offline, and yours to keep. Sign in with a free LowHigh account to scan and sync across your devices.",
   },
 ];
 

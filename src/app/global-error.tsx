@@ -1,28 +1,25 @@
 "use client";
 
-/**
- * global-error.tsx — last-resort boundary for crashes in the ROOT layout
- * itself, which the route-level error.tsx cannot catch. It replaces the
- * entire document, so it must render its own <html>/<body> and cannot rely
- * on the app's global CSS (the layout that imports it is what failed) — all
- * styling is inlined with the theme's literal colors.
- */
-
 import { useEffect } from "react";
 
-interface GlobalErrorProps {
+/**
+ * Root-level error boundary. Unlike error.tsx, this catches failures thrown by
+ * the root layout itself and its providers (AuthProvider, EcosystemProvider,
+ * ServiceWorkerRegister) — cases where error.tsx never mounts. It must render
+ * its own <html>/<body> because it replaces the whole document tree.
+ *
+ * Kept deliberately dependency-free (inline styles, no imported components) so
+ * it can render even if the failure is in the shared UI/provider layer.
+ */
+export default function GlobalError({
+  error,
+  reset,
+}: {
   error: Error & { digest?: string };
   reset: () => void;
-}
-
-const GOLD = "#c9a84c";
-const BG = "#0c0a09";
-const TEXT = "#fafaf9";
-const MUTED = "#a8a29e";
-
-export default function GlobalError({ error, reset }: GlobalErrorProps) {
+}) {
   useEffect(() => {
-    console.error("[Global Exception Boundary]:", error);
+    console.error("[Global Error Boundary]:", error);
   }, [error]);
 
   return (
@@ -31,48 +28,64 @@ export default function GlobalError({ error, reset }: GlobalErrorProps) {
         style={{
           margin: 0,
           minHeight: "100vh",
-          background: BG,
-          color: TEXT,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
-          padding: "3rem 1.5rem",
           textAlign: "center",
-          fontFamily: "system-ui, -apple-system, sans-serif",
+          padding: "3rem 1.5rem",
+          background: "#0c0a09",
+          color: "#fafaf9",
+          fontFamily:
+            "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
         }}
       >
         <div style={{ maxWidth: "28rem", width: "100%" }}>
           <div
             style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: "4rem",
-              height: "4rem",
-              borderRadius: "1rem",
-              marginBottom: "1.5rem",
-              background: "rgba(239, 68, 68, 0.08)",
-              border: "1px solid rgba(239, 68, 68, 0.25)",
+              fontFamily: "Playfair Display, Georgia, serif",
+              fontSize: "1.5rem",
+              fontWeight: 600,
+              letterSpacing: "0.02em",
+              marginBottom: "2rem",
             }}
           >
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-              <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
-              <line x1="12" y1="9" x2="12" y2="13" />
-              <line x1="12" y1="17" x2="12.01" y2="17" />
-            </svg>
+            <span>Grave</span>
+            <span style={{ color: "#c9a84c" }}>Lens</span>
           </div>
 
-          <h1 style={{ fontSize: "1.75rem", fontWeight: 600, margin: "0 0 0.75rem", lineHeight: 1.3 }}>
-            GraveLens hit a problem
+          <h1
+            style={{
+              fontSize: "1.5rem",
+              fontWeight: 600,
+              lineHeight: 1.3,
+              margin: "0 0 0.75rem",
+            }}
+          >
+            Something went wrong
           </h1>
-          <p style={{ color: MUTED, fontSize: "0.9rem", lineHeight: 1.6, margin: "0 0 1.5rem" }}>
-            The app failed to load. Your saved scans and offline queue remain safe on this device.
+          <p
+            style={{
+              color: "#a8a29e",
+              fontSize: "0.875rem",
+              lineHeight: 1.6,
+              margin: "0 0 1.75rem",
+            }}
+          >
+            An unexpected error occurred. Your saved data and scan queue remain
+            secure on this device.
           </p>
 
           {error.digest && (
-            <p style={{ color: "#78716c", fontSize: "0.7rem", margin: "0 0 1.5rem" }}>
-              Reference: {error.digest}
+            <p
+              style={{
+                color: "#78716c",
+                fontSize: "0.65rem",
+                fontFamily: "ui-monospace, SFMono-Regular, monospace",
+                marginBottom: "1.75rem",
+              }}
+            >
+              Digest: {error.digest}
             </p>
           )}
 
@@ -81,16 +94,16 @@ export default function GlobalError({ error, reset }: GlobalErrorProps) {
             style={{
               width: "100%",
               height: "3rem",
-              borderRadius: "0.75rem",
               border: "none",
+              borderRadius: "0.75rem",
               fontWeight: 600,
-              fontSize: "0.9rem",
+              fontSize: "0.875rem",
               color: "#1a1917",
-              background: GOLD,
               cursor: "pointer",
+              background: "linear-gradient(135deg, #c9a84c, #d9bd63)",
             }}
           >
-            Reload GraveLens
+            Try Again
           </button>
         </div>
       </body>

@@ -32,14 +32,23 @@ export default function ServiceWorkerRegister() {
     // ── 1. Register service worker ──────────────────────────────────────────
     if (!("serviceWorker" in navigator)) return;
 
-    // Never register in local dev — the SW serves cached bundles that are
-    // stale the moment source changes, causing hydration mismatches and
-    // making every change unverifiable until a manual unregister.
+    // Never run the caching SW in local dev. It serves /_next/static chunks
+    // cache-first, but `next dev` recompiles fresh chunk hashes constantly, so
+    // the stale cache makes the dev runtime detect a version mismatch and hard
+    // reload — re-serving the same stale assets in an infinite reload loop.
+    // Tear down any SW + caches left over from a prior prod/PWA visit so a
+    // developer who hit the loop is freed on the next load, then bail.
     if (process.env.NODE_ENV !== "production") {
       navigator.serviceWorker
         .getRegistrations()
         .then((regs) => regs.forEach((r) => r.unregister()))
         .catch(() => {});
+      if (typeof caches !== "undefined") {
+        caches
+          .keys()
+          .then((keys) => keys.forEach((k) => caches.delete(k)))
+          .catch(() => {});
+      }
       return;
     }
 
@@ -65,7 +74,7 @@ export default function ServiceWorkerRegister() {
     let lastPoll = 0;
 
     const checkVersion = async () => {
-      if (process.env.NODE_ENV !== "production" || CLIENT_BUILD_TIME === "dev") return; // skip in local dev
+      if (CLIENT_BUILD_TIME === "dev") return; // skip in local dev
       const now = Date.now();
       if (now - lastPoll < POLL_THROTTLE_MS) return;
       lastPoll = now;
@@ -103,7 +112,7 @@ export default function ServiceWorkerRegister() {
 
   return (
     <div
-      className="fixed z-[100] flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl animate-fade-up"
+      className="fixed z-100 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl animate-fade-up"
       style={{
         bottom: "calc(5.5rem + env(safe-area-inset-bottom, 0px))",
         left: "50%",
