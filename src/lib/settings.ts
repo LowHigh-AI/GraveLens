@@ -30,6 +30,13 @@ export interface AppSettings {
   analysisMode: AnalysisMode;
   showPhotoTips: boolean;
   photoSaveTarget: PhotoSaveTarget;
+
+  // Community — local mirror of the profile's share_all_by_default preference,
+  // so the offline sync path can decide a new scan's is_public flag synchronously.
+  // Source of truth is gravelens_user_profiles.share_all_by_default; this is kept
+  // in sync on the consent prompt and the Settings toggle, and hydrated from the
+  // profile on sign-in.
+  shareWithCommunity: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -44,6 +51,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   analysisMode: "fast",
   showPhotoTips: true,
   photoSaveTarget: "app-only",
+  shareWithCommunity: true,
 };
 
 const STORAGE_KEY = "gl_settings";

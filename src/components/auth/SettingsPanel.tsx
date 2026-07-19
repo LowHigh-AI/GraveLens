@@ -157,7 +157,7 @@ export default function SettingsPanel({ onClose }: Props) {
   // Community profile state. `showName` = show my Display Name on the community
   // map (reuses the legacy `show_username` column); when off, I appear anonymous.
   const [showName, setShowName] = useState(false);
-  const [shareAll, setShareAll] = useState(false);
+  const [shareAll, setShareAll] = useState(true);
   const [shareAllConfirm, setShareAllConfirm] = useState(false);
 
   // Account (shared LowHigh) state
@@ -447,6 +447,9 @@ export default function SettingsPanel({ onClose }: Props) {
     }
     setShareAll(next);
     setShareAllConfirm(false);
+    // Mirror into local settings so the offline sync path stamps new scans
+    // with the same preference (see cloudSync.upsertGrave).
+    patchSettings({ shareWithCommunity: next });
     if (!user) return;
     try {
       const supabase = createClient();

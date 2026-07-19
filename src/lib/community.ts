@@ -95,7 +95,7 @@ export async function fetchOwnProfile(
     username: data.username ?? undefined,
     displayName: data.display_name ?? undefined,
     showUsername: data.show_username ?? true,
-    shareAllByDefault: data.share_all_by_default ?? false,
+    shareAllByDefault: data.share_all_by_default ?? true,
     explorerXp: data.explorer_xp ?? 0,
     explorerRank: data.explorer_rank ?? 1,
     graveCount: data.scan_count ?? 0,

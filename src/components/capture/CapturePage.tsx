@@ -18,6 +18,7 @@ import type { ExtractedGraveData, GeoLocation } from "@/types";
 import { localContrastBoost, unsharpMask } from "@/lib/relief";
 import { resizeForStorage, generateThumbnail, saveToDevice } from "@/lib/imageUtils";
 import OnboardingCarousel from "@/components/onboarding/OnboardingCarousel";
+import CommunityConsentModal from "@/components/onboarding/CommunityConsentModal";
 import { loadSettings, SETTINGS_CHANGED_EVENT } from "@/lib/settings";
 
 type Phase = "idle" | "processing" | "queued" | "degraded_prompt";
@@ -391,6 +392,7 @@ export default function CapturePage() {
       backgroundClass="bg-transparent"
     >
       <OnboardingCarousel />
+      <CommunityConsentModal />
       {/* Main content */}
       <>
         {phase === "idle" && (

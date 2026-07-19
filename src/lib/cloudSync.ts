@@ -13,6 +13,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { GraveRecord } from "@/types";
 import { getAllGraves, getGrave, saveGrave } from "@/lib/storage";
 import { photoProxyUrl } from "@/lib/photoUrl";
+import { loadSettings } from "@/lib/settings";
 import {
   loadUnlocks,
   loadStats,
@@ -157,7 +158,10 @@ export async function upsertGrave(
     research: record.research ?? {},
     tags: record.tags ?? [],
     user_notes: record.userNotes ?? null,
-    is_public: record.isPublic ?? false,
+    // No per-grave override in this design, so record.isPublic is normally
+    // undefined and every scan follows the user's global community-sharing
+    // preference (default on, set at the first-run consent prompt / Settings).
+    is_public: record.isPublic ?? loadSettings().shareWithCommunity,
     community_note: record.communityNote ?? null,
     synced_at: new Date().toISOString(),
   });
