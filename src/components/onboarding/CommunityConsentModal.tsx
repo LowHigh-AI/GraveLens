@@ -39,13 +39,14 @@ export default function CommunityConsentModal() {
     (async () => {
       // Hydrate the local mirror from the profile so a prior opt-out on another
       // device is respected by this device's sync path — even if we don't
-      // re-prompt here.
+      // re-prompt here. NOTE: we intentionally do NOT hydrate the modal's own
+      // pre-selection from this value — the consent prompt always presents
+      // "Share" as the recommended default; tapping Continue opts in.
       try {
         const profile = await fetchOwnProfile(createClient(), user.id);
         if (!active) return;
         if (profile) {
           patchSettings({ shareWithCommunity: profile.shareAllByDefault });
-          setShare(profile.shareAllByDefault);
         }
       } catch { /* offline — fall back to local default */ }
 
